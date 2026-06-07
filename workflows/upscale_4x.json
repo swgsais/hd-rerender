@@ -1,0 +1,30 @@
+{
+  "_comment": "ComfyUI /prompt API workflow: load PNG -> ESRGAN upscale -> save PNG. Placeholders {INPUT_NAME}, {OUTPUT_PREFIX}, and {MODEL_NAME} are substituted by hd_rerender.py before submission.",
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{INPUT_NAME}",
+      "upload": "image"
+    }
+  },
+  "2": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "{MODEL_NAME}"
+    }
+  },
+  "3": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": ["2", 0],
+      "image": ["1", 0]
+    }
+  },
+  "4": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "{OUTPUT_PREFIX}",
+      "images": ["3", 0]
+    }
+  }
+}

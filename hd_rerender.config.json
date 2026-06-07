@@ -1,0 +1,5 @@
+{
+  "comfy_root": "C:/Users/jbird/Desktop/arc/ComfyUI_windows_portable/ComfyUI",
+  "comfy_api": "http://127.0.0.1:8188",
+  "upscale_model": "4x-PBRify_UpscalerSPANV4.pth"
+}

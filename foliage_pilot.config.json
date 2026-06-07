@@ -1,0 +1,6 @@
+{
+  "_comment": "Foliage pilot v2 — DAT2 albedo upscaler (less hallucination than SPAN). Once albedo HD looks right, we'll layer in 1x-PBRify_NormalV3 and _RoughnessV2 generation.",
+  "comfy_root": "C:/Users/jbird/Desktop/arc/ComfyUI_windows_portable/ComfyUI",
+  "comfy_api": "http://127.0.0.1:8188",
+  "upscale_model": "4x-PBRify_UpscalerDAT2_V1.pth"
+}

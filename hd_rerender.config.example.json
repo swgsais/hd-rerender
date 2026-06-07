@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy to hd_rerender.config.json and edit. comfy_root must be the directory containing main.py and the input/, output/, models/ subfolders. upscale_model is the filename of a .pth in models/upscale_models/.",
+  "comfy_root": "C:/ComfyUI_windows_portable/ComfyUI",
+  "comfy_api": "http://127.0.0.1:8188",
+  "upscale_model": "4x-UltraSharp.pth"
+}
