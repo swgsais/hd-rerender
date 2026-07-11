@@ -3,7 +3,7 @@
 Mirror SWGRestoration's HD asset *selection*, re-rendered from our own sources.
 
 SWGRestoration encrypts their TRE payloads (AES), so we cannot use their bytes.
-But their TOC (client-tools/restoration-toc/restoration_index.csv) is a readable
+But their TOC (restoration-toc/restoration_index.csv) is a readable
 manifest of WHICH textures they enhanced. This tool:
 
   manifest : restoration HD list  ->  intersect with our sources  -> targets.json
@@ -43,8 +43,6 @@ from pathlib import Path
 from PIL import Image
 
 THIS_DIR = Path(__file__).resolve().parent
-CLIENT_TOOLS = THIS_DIR.parent
-sys.path.insert(0, str(CLIENT_TOOLS))
 sys.path.insert(0, str(THIS_DIR))
 
 from pil_upscale import read_dds_format, TEXCONV_FORMAT        # BGRA-aware
@@ -52,7 +50,7 @@ from categorize import categorize                              # bucketing
 import hd_rerender as hr                                       # ComfyUI helpers + load_config
 
 TEXCONV   = THIS_DIR / 'bin' / 'texconv.exe'
-TOC_DIR   = CLIENT_TOOLS / 'restoration-toc'
+TOC_DIR   = THIS_DIR / 'restoration-toc'
 STAGING   = THIS_DIR / 'staging'
 DDS_IN    = STAGING / 'dds_in' / 'texture'
 PNG_IN    = STAGING / 'png_in'

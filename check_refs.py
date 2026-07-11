@@ -1,7 +1,7 @@
 """Sanity-check that all asset references in the shader_fix override TRE
 shaders resolve to files that exist in some TRE."""
 import os, re, sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_tre import _open_tre
 
 # Tokens that begin a valid SWG asset path inside a .sht binary

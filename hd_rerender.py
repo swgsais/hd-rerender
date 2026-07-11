@@ -44,9 +44,10 @@ DEFAULT_CFG  = THIS_DIR / 'hd_rerender.config.json'
 TEXCONV      = THIS_DIR / 'bin' / 'texconv.exe'
 WORKFLOW_TPL = THIS_DIR / 'workflows' / 'upscale_4x.json'
 PROJECT_ROOT = THIS_DIR.parent.parent          # E:/GameDev/SWGSource
-EXTRACT_TRE  = THIS_DIR.parent / 'extract_tre.py'
-CLIENT_TOOLS = THIS_DIR.parent                 # so build_tre / swg_crc import works
-sys.path.insert(0, str(CLIENT_TOOLS))
+# TRE tooling (extract_tre / build_tre / swg_crc) is vendored in this repo so
+# the pipeline runs standalone, without a client-tools checkout alongside.
+EXTRACT_TRE  = THIS_DIR / 'extract_tre.py'
+sys.path.insert(0, str(THIS_DIR))
 
 # ---------------------------------------------------------------------------
 # DDS header parsing — just enough to round-trip format and mipmap count.
