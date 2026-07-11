@@ -4,11 +4,17 @@ SWG TRE texture HD re-render pipeline.
 
 Five-phase pipeline, each is a subcommand and resumable independently:
 
-    extract  reborn_textures.tre  ->  staging/dds_in/texture/*.dds  + manifest.json
+    extract  <source>.tre         ->  staging/dds_in/texture/*.dds  + manifest.json
     decode   staging/dds_in       ->  staging/png_in/*.png         (texconv -ft png)
     upscale  staging/png_in       ->  staging/png_out/*.png        (ComfyUI /prompt API)
     encode   staging/png_out      ->  staging/dds_out/*.dds        (texconv, original BC fmt, mip regen)
-    repack   staging/dds_out      ->  client/tre/reborn_textures_hd.tre  (build_tre.py)
+    repack   staging/dds_out      ->  <source>_hd.tre              (build_tre.py)
+
+The source archive is whatever --tre points at: any TRE containing
+texture/*.dds entries (or a directory of TREs, extracted in patch-priority
+order). Staging defaults to staging/<source stem>/ next to this script so
+runs against different archives never share intermediate state, and the
+output defaults to <source stem>_hd.tre next to the source.
 
 `all` runs the lot. Every phase skips files whose output already exists, so
 killing the run mid-way and restarting picks up where it left off.
@@ -43,7 +49,6 @@ THIS_DIR     = Path(__file__).resolve().parent
 DEFAULT_CFG  = THIS_DIR / 'hd_rerender.config.json'
 TEXCONV      = THIS_DIR / 'bin' / 'texconv.exe'
 WORKFLOW_TPL = THIS_DIR / 'workflows' / 'upscale_4x.json'
-PROJECT_ROOT = THIS_DIR.parent.parent          # E:/GameDev/SWGSource
 # TRE tooling (extract_tre / build_tre / swg_crc) is vendored in this repo so
 # the pipeline runs standalone, without a client-tools checkout alongside.
 EXTRACT_TRE  = THIS_DIR / 'extract_tre.py'
@@ -154,7 +159,7 @@ def save_manifest(path: Path, manifest: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: extract DDS from reborn_textures.tre
+# Phase 1: extract DDS from the source TRE(s)
 
 def phase_extract(args, cfg: dict) -> int:
     out_dir = Path(args.staging) / 'dds_in'
@@ -516,7 +521,7 @@ def phase_repack(args, cfg: dict) -> int:
         sizes[-1] += sz
 
     base_out = Path(args.out_tre).resolve()
-    stem = base_out.stem        # reborn_textures_hd
+    stem = base_out.stem        # e.g. reborn_textures_hd
     parent = base_out.parent
 
     print(f'[repack] sharding {len(files)} entries ({sum(sizes)/1024/1024/1024:.1f} GB raw) '
@@ -557,7 +562,7 @@ def phase_repack(args, cfg: dict) -> int:
 
     print(f'[repack] done — {len(shards)} TRE shards. Add ALL of them to your '
           f'client load order, in numeric order, at higher priority than '
-          f'reborn_textures.tre.')
+          f'{Path(args.tre).name}.')
     return 0
 
 
@@ -576,14 +581,28 @@ def phase_all(args, cfg: dict) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='SWG TRE texture HD re-render pipeline')
     ap.add_argument('--config', default=str(DEFAULT_CFG))
-    ap.add_argument('--staging', default=str(THIS_DIR / 'staging'))
-    ap.add_argument('--tre', default=str(PROJECT_ROOT / 'client' / 'tre' / 'reborn_textures.tre'))
-    ap.add_argument('--out-tre', default=str(PROJECT_ROOT / 'client' / 'tre' / 'reborn_textures_hd.tre'))
+    ap.add_argument('--staging', default=None,
+                    help='work dir for intermediates (default: staging/<tre stem>/ next to this script)')
+    ap.add_argument('--tre', required=True,
+                    help='source .tre archive with texture/*.dds entries, or a directory of .tre files')
+    ap.add_argument('--out-tre', default=None,
+                    help='output archive path (default: <tre stem>_hd.tre next to the source)')
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--timeout', type=float, default=300.0, help='per-prompt timeout in seconds')
     ap.add_argument('--overwrite', action='store_true')
     ap.add_argument('phase', choices=['extract', 'decode', 'upscale', 'encode', 'repack', 'all'])
     args = ap.parse_args(argv)
+
+    src = Path(args.tre).resolve()
+    if not src.exists():
+        ap.error(f'--tre path does not exist: {src}')
+    # Directory sources (extract_tre handles patch-priority layering) take the
+    # directory name as the stem; single files drop their .tre suffix.
+    stem = src.stem if src.is_file() else src.name
+    if args.staging is None:
+        args.staging = str(THIS_DIR / 'staging' / stem)
+    if args.out_tre is None:
+        args.out_tre = str((src.parent if src.is_file() else src) / f'{stem}_hd.tre')
 
     cfg = load_config(Path(args.config))
     fns = {

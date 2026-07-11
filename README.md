@@ -1,14 +1,16 @@
 # SWG TRE HD Re-Render Pipeline
 
-End-to-end pipeline that takes textures out of `reborn_textures.tre`, runs them
-through a local ComfyUI ESRGAN upscale (4×), re-encodes back to the original
-DDS/BCx format with regenerated mipmaps, and ships them as
-`reborn_textures_hd.tre` for the client to load at higher patch priority.
+End-to-end pipeline that takes textures out of any TRE archive (`--tre`), runs
+them through a local ComfyUI ESRGAN upscale (4×), re-encodes back to the
+original DDS/BCx format with regenerated mipmaps, and ships them as
+`<source>_hd.tre` for the client to load at higher patch priority. The source
+can be a single `.tre` or a directory of them (extracted in patch-priority
+order).
 
 ## What it does
 
 ```
-reborn_textures.tre                                                    client loads
+<source>.tre  (e.g. reborn_textures.tre)                               client loads
         │                                                                    ▲
         │ extract  (extract_tre.py, filter texture/*.dds)                    │
         ▼                                                                    │
@@ -28,7 +30,7 @@ reborn_textures.tre                                                    client lo
         │                                                                    │
         │ repack   (build_tre.TreWriter, TRE 0005)                           │
         ▼                                                                    │
-   client/tre/reborn_textures_hd.tre  ──────────────────────────────────────┘
+   <source>_hd.tre  (sharded _001, _002, … if > 2 GiB)  ─────────────────────┘
 ```
 
 Every phase is **resumable**. Re-running skips outputs that already exist.
@@ -85,30 +87,33 @@ Confirm it's up with `curl http://127.0.0.1:8188/system_stats`.
 ### Full pipeline
 
 ```powershell
-python hd_rerender.py all
+python hd_rerender.py --tre E:\path\to\reborn_textures.tre all
 ```
 
 ### Phase by phase (recommended on first run)
 
 ```powershell
-python hd_rerender.py extract   # ~1 min,  ~3 GB to staging/dds_in/
-python hd_rerender.py decode    # ~5 min,  staging/png_in/
-python hd_rerender.py upscale   # hours on a single GPU — this is the long one
-python hd_rerender.py encode    # ~15 min, staging/dds_out/
-python hd_rerender.py repack    # ~1 min,  reborn_textures_hd.tre
+$src = "E:\path\to\reborn_textures.tre"
+python hd_rerender.py --tre $src extract   # ~1 min,  ~3 GB to staging/<stem>/dds_in/
+python hd_rerender.py --tre $src decode    # ~5 min,  staging/<stem>/png_in/
+python hd_rerender.py --tre $src upscale   # hours on a single GPU — this is the long one
+python hd_rerender.py --tre $src encode    # ~15 min, staging/<stem>/dds_out/
+python hd_rerender.py --tre $src repack    # ~1 min,  <stem>_hd.tre next to the source
 ```
 
 ### Useful flags
 
 ```
+--tre PATH           REQUIRED. Source .tre with texture/*.dds entries, or a
+                     directory of .tre files (patch-priority extraction).
+--out-tre PATH       output TRE; default <tre stem>_hd.tre next to the source
+--staging DIR        work dir; default ./staging/<tre stem>/ — each source
+                     archive gets its own staging so runs never mix
 --workers N          decode/encode parallelism (default 4). upscale uses N as
                      parallel-submit count; ComfyUI queues internally so 2-4
                      keeps the GPU saturated.
 --timeout SECS       per-prompt timeout; raise on slow GPUs (default 300)
 --overwrite          re-do already-completed files
---tre PATH           input TRE; default client/tre/reborn_textures.tre
---out-tre PATH       output TRE; default client/tre/reborn_textures_hd.tre
---staging DIR        staging root; default ./staging/
 --config PATH        config json; default ./hd_rerender.config.json
 ```
 
