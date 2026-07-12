@@ -63,10 +63,14 @@ CATEGORIES_JSON = STAGING / 'restoration_categories.json'
 # --scale on `render` override for A/B pilots.
 SPAN = '4x-PBRify_UpscalerSPANV4.pth'
 DAT2 = '4x-PBRify_UpscalerDAT2_V1.pth'
+DEVIANCE = '4x_BS_DevianceMIP.pth'
 CATEGORY_PLAN = {
     'arch':        {'method': 'lanczos', 'scale': 3, 'model': None},
     'organic':     {'method': 'comfy',   'scale': 3, 'model': DAT2},
-    'hardsurface': {'method': 'comfy',   'scale': 2, 'model': DAT2},  # user A/B pick: DAT2 > SPAN
+    # Composite-armor pilot vs SWGRestoration reference: DevianceMIP matched
+    # resto's smooth-bright look (PSNR 25.6 on reborn source, texture energy
+    # 29.4 vs resto 29.0); DAT2 amplified dither into dot-grid artifacts.
+    'hardsurface': {'method': 'comfy',   'scale': 2, 'model': DEVIANCE},
     'special':     {'method': 'copy',    'scale': 1, 'model': None},
     'cube':        {'method': 'copy',    'scale': 1, 'model': None},
     'ui':          {'method': 'copy',    'scale': 1, 'model': None},
