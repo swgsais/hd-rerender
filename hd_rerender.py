@@ -420,12 +420,39 @@ def phase_upscale(args, cfg: dict) -> int:
 # ---------------------------------------------------------------------------
 # Phase 4: encode PNG -> DDS via texconv, using manifest for original format.
 
+def restore_alpha(png_out: Path, png_in_dir: Path) -> bool:
+    """ComfyUI's SaveImage writes RGB only, so the source alpha is lost —
+    which turns alpha-cut foliage/glass/decals into opaque quads showing the
+    texture's background color. If the source PNG carries a real alpha
+    channel and the upscaled PNG doesn't, Lanczos-upscale the source alpha
+    and merge it in (overwriting png_out; idempotent). Returns True if fixed.
+    """
+    from PIL import Image
+    src_png = png_in_dir / png_out.name
+    if not src_png.exists():
+        return False
+    src = Image.open(src_png)
+    if src.mode not in ('RGBA', 'LA') and 'transparency' not in src.info:
+        return False
+    src_a = src.convert('RGBA').split()[3]
+    if src_a.getextrema()[0] == 255:        # fully opaque source
+        return False
+    out = Image.open(png_out)
+    if out.mode == 'RGBA' and out.split()[3].getextrema()[0] < 255:
+        return False                        # upscaled alpha already present
+    rgb = out.convert('RGB')
+    a = src_a.resize(rgb.size, Image.LANCZOS)
+    Image.merge('RGBA', (*rgb.split(), a)).save(png_out)
+    return True
+
+
 def phase_encode(args, cfg: dict) -> int:
     if not TEXCONV.exists():
         raise SystemExit(f'texconv not found at {TEXCONV}')
     manifest_path = Path(args.staging) / 'manifest.json'
     manifest = load_manifest(manifest_path)
     in_dir  = Path(args.staging) / 'png_out'
+    png_in_dir = Path(args.staging) / 'png_in'
     out_dir = Path(args.staging) / 'dds_out' / 'texture'
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -434,6 +461,7 @@ def phase_encode(args, cfg: dict) -> int:
     # manifest key is simply <png.stem>.dds.
     by_fmt: dict[str, list[Path]] = {}
     skipped = 0
+    alpha_fixed = 0
     for png in in_dir.glob('*.png'):
         dds_name = png.stem + '.dds'
         meta = manifest['entries'].get(dds_name)
@@ -445,9 +473,12 @@ def phase_encode(args, cfg: dict) -> int:
         if target.exists() and not args.overwrite:
             skipped += 1
             continue
+        if restore_alpha(png, png_in_dir):
+            alpha_fixed += 1
         by_fmt.setdefault(tex_fmt, []).append((png, dds_name))
 
-    print(f'[encode] {sum(len(v) for v in by_fmt.values())} PNG -> DDS  ({skipped} skipped existing)')
+    print(f'[encode] {sum(len(v) for v in by_fmt.values())} PNG -> DDS  '
+          f'({skipped} skipped existing, {alpha_fixed} source alphas re-attached)')
 
     BATCH = 100
     t0 = time.time()
@@ -458,12 +489,16 @@ def phase_encode(args, cfg: dict) -> int:
         for i in range(0, len(items), BATCH):
             chunk = items[i:i+BATCH]
             # texconv -f <fmt> -m 0 (full chain) -o <dir> input1 input2 ...
+            # -sepalpha: filter alpha independently of color when generating
+            # mips; texconv's default alpha-weighted filter darkens color in
+            # low-alpha regions on lower mips (dark-at-distance bug).
             cmd = [
                 str(TEXCONV),
                 '-nologo',
                 '-y',
                 '-f', tex_fmt,
                 '-m', '0',                 # full mipmap chain at new (4x) size
+                '-sepalpha',
                 '-ft', 'dds',
                 '-o', str(out_dir),
             ] + [str(p) for (p, _name) in chunk]
