@@ -42,13 +42,13 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 THIS_DIR     = Path(__file__).resolve().parent
 DEFAULT_CFG  = THIS_DIR / 'hd_rerender.config.json'
 TEXCONV      = THIS_DIR / 'bin' / 'texconv.exe'
-WORKFLOW_TPL = THIS_DIR / 'workflows' / 'upscale_4x.json'
+WORKFLOW_TPL = THIS_DIR / 'workflows' / 'upscale_4x_batch.json'
 # TRE tooling (extract_tre / build_tre / swg_crc) is vendored in this repo so
 # the pipeline runs standalone, without a client-tools checkout alongside.
 EXTRACT_TRE  = THIS_DIR / 'extract_tre.py'
@@ -75,6 +75,14 @@ TEXCONV_FORMAT = {
     'RGB8':  'R8G8B8A8_UNORM',   # promote 24-bit to 32-bit on re-encode
     'L8':    'R8_UNORM',
 }
+
+# texconv formats whose block compressor already spreads a *single* file's
+# work across all available cores (DirectXTex's BC7 encoder in particular).
+# Running many of these concurrently oversubscribes the machine, so they get
+# a small, no-singleproc process pool. Every other format compresses fast
+# per file with little/no internal threading, so those run -singleproc,
+# workers-wide, trading one-file-per-core for one-invocation-uses-all-cores.
+SELF_THREADED_TEXCONV_FORMATS = {'BC7_UNORM'}
 
 
 def read_dds_meta(path: Path) -> dict:
@@ -237,30 +245,43 @@ def phase_decode(args, cfg: dict) -> int:
         return 0
 
     # texconv accepts many files per invocation, amortizing process startup.
-    # Batch of 200 keeps argv well under Windows' ~32K limit.
+    # Batch of 200 keeps argv well under Windows' ~32K limit. Batches are
+    # dispatched --workers-wide as concurrent texconv child processes (the
+    # decode direction has no BC compressor to self-thread, so a serial
+    # invocation-per-batch loop was leaving every core but one idle).
+    # -singleproc keeps each child from also spinning up its own internal
+    # thread pool and fighting the others for cores.
     BATCH = 200
+    chunks = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
+    base_cmd = [
+        str(TEXCONV),
+        '-nologo',
+        '-y',                       # overwrite output if exists
+        '-singleproc',
+        '-ft', 'png',
+        '-o', str(out_dir),
+        '-m', '1',                  # decode only mip 0
+    ]
+
     t0 = time.time()
     attempted = 0
-    for i in range(0, len(todo), BATCH):
-        chunk = todo[i:i + BATCH]
-        cmd = [
-            str(TEXCONV),
-            '-nologo',
-            '-y',                       # overwrite output if exists
-            '-ft', 'png',
-            '-o', str(out_dir),
-            '-m', '1',                  # decode only mip 0
-        ] + [str(p) for p in chunk]
-        rc = subprocess.call(cmd, stdout=subprocess.DEVNULL)
-        attempted += len(chunk)
-        if rc != 0:
-            # rc=1 here usually means one specific file in the batch tripped;
-            # the rest of the batch may have decoded fine. Truth is on disk.
-            print(f'  WARN texconv rc={rc} on chunk starting {chunk[0].name} '
-                  f'(checking outputs)', file=sys.stderr)
-        if (i // BATCH) % 5 == 0:
-            print(f'  decoded {attempted}/{len(todo)}  '
-                  f'({attempted / max(0.001, time.time()-t0):.1f} files/s)')
+    completed_chunks = 0
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {pool.submit(subprocess.call, base_cmd + [str(p) for p in c],
+                                stdout=subprocess.DEVNULL): c for c in chunks}
+        for fut in as_completed(futures):
+            chunk = futures[fut]
+            rc = fut.result()
+            attempted += len(chunk)
+            completed_chunks += 1
+            if rc != 0:
+                # rc=1 here usually means one specific file in the batch tripped;
+                # the rest of the batch may have decoded fine. Truth is on disk.
+                print(f'  WARN texconv rc={rc} on chunk starting {chunk[0].name} '
+                      f'(checking outputs)', file=sys.stderr)
+            if completed_chunks % 5 == 0 or completed_chunks == len(chunks):
+                print(f'  decoded ~{attempted}/{len(todo)}  '
+                      f'({attempted / max(0.001, time.time()-t0):.1f} files/s)')
 
     # Source-of-truth count: how many target PNGs actually exist on disk.
     ok = sum(1 for p in todo if (out_dir / (p.stem + '.png')).exists())
@@ -314,15 +335,117 @@ def wait_for_prompt(api: str, prompt_id: str, timeout: float = 300.0) -> dict:
     raise TimeoutError(f'prompt {prompt_id} did not complete in {timeout}s')
 
 
+def comfy_interrupt(api: str) -> None:
+    """Best-effort: cancel whatever ComfyUI is currently executing.
+
+    Giving up on a poll (wait_for_prompt raising TimeoutError) does NOT
+    cancel the job server-side - it just stops us waiting for it. Without
+    this, a caller that resubmits after a timeout piles a new job in behind
+    one that's still running/queued, which is what actually causes ComfyUI
+    to look permanently stuck under repeated retries: each timeout adds net
+    new backlog instead of clearing anything. Only unambiguous when at most
+    one batch is in flight at a time (see --workers on the upscale phase).
+    """
+    try:
+        req = urllib.request.Request(api.rstrip('/') + '/interrupt', data=b'', method='POST')
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # best-effort only - don't let a failed cancel mask the real error
+
+
+# Pixel budget per batch: a (256,256) batch gets ~128 images, (512,512) ~32,
+# (1024,1024) ~8, (2048,2048) ~2. Doubled from the original conservative
+# starting point after a real run showed peak VRAM (Dedicated Memory) never
+# crossing ~6.3GB / 38% on a 16GB card - retry_shrinking() below is the
+# safety net if this still overshoots on some batch, so keep raising this
+# (and re-checking peak VRAM) as long as there's clear headroom.
+DEFAULT_BATCH_PIXEL_BUDGET = 256 * 256 * 128
+
+
+def load_png_dims(staging: Path, todo: list[Path]) -> dict[Path, tuple[int, int]]:
+    """Look up each PNG's (width, height) from manifest.json, keyed by its
+    corresponding source <stem>.dds entry. Reads the manifest fresh every
+    call rather than hardcoding a size list, so batch grouping automatically
+    tracks whatever the current texture set actually contains.
+    """
+    manifest = load_manifest(staging / 'manifest.json')
+    entries = manifest['entries']
+    dims: dict[Path, tuple[int, int]] = {}
+    for p in todo:
+        meta = entries.get(p.stem + '.dds')
+        if meta is not None:
+            dims[p] = (meta['width'], meta['height'])
+    return dims
+
+
+def build_upscale_batches(dims: dict[Path, tuple[int, int]], pixel_budget: int) -> list[list[Path]]:
+    """Group same-size files into VRAM-budgeted batches. One /prompt
+    submission per batch instead of per file is the whole point - see
+    phase_upscale for why.
+    """
+    by_size: dict[tuple[int, int], list[Path]] = {}
+    for p, wh in dims.items():
+        by_size.setdefault(wh, []).append(p)
+
+    batches: list[list[Path]] = []
+    for (w, h), files in by_size.items():
+        files.sort()  # deterministic batch membership across reruns
+        cap = max(1, pixel_budget // (w * h))
+        for i in range(0, len(files), cap):
+            batches.append(files[i:i + cap])
+    return batches
+
+
+def retry_shrinking(batch: list[Path], attempt) -> list[tuple[str, str | None]]:
+    """Run attempt(batch) and, on any failure, retry just the failed subset
+    split into two smaller batches - halving bottoms out at size 1, so this
+    is bounded and terminates. A batch-level failure is most likely VRAM
+    exhaustion at that batch size (the upscale workflow is all-or-nothing
+    per graph execution), so a too-large --batch-pixel-budget self-corrects
+    at runtime instead of just failing outright.
+
+    Timeouts (error strings tagged 'TIMEOUT: ' by attempt()) are excluded
+    from this - resubmitting a timed-out batch doesn't address anything
+    (the batch size likely wasn't the problem, and ComfyUI may still be
+    working through the original, now-interrupted job), it just piles more
+    load behind whatever's actually stuck. Report those once and let a
+    later `upscale` re-run pick them up via the normal skip-existing
+    resumability, instead of auto-splitting into a retry storm.
+
+    attempt(batch) -> list[(name, err|None)] in the same order as batch.
+    """
+    outcomes = attempt(batch)
+    by_name = {p.name: p for p in batch}
+    results = [(n, e) for n, e in outcomes if e is None]
+    failed = [(n, e) for n, e in outcomes if e is not None]
+    if not failed:
+        return results
+    if all(e.startswith('TIMEOUT: ') for _n, e in failed):
+        return results + failed
+    if len(failed) == 1:
+        n, e = failed[0]
+        return results + [(n, f'{e} (size-1, no further retry possible)')]
+
+    failed_batch = [by_name[n] for n, _e in failed]
+    mid = len(failed_batch) // 2
+    print(f'  [upscale] {len(failed_batch)}/{len(batch)} failed in a batch '
+          f'({failed[0][1]}), retrying as batches of {mid} and {len(failed_batch)-mid}',
+          file=sys.stderr)
+    return (results
+            + retry_shrinking(failed_batch[:mid], attempt)
+            + retry_shrinking(failed_batch[mid:], attempt))
+
+
 def phase_upscale(args, cfg: dict) -> int:
     in_dir  = Path(args.staging) / 'png_in'
     out_dir = Path(args.staging) / 'png_out'
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    comfy_input  = Path(cfg['comfy_root']) / 'input'  / 'swg'
-    comfy_output = Path(cfg['comfy_root']) / 'output' / 'swg_hd'
+    comfy_input      = Path(cfg['comfy_root']) / 'input'  / 'swg'
+    comfy_output_root = Path(cfg['comfy_root']) / 'output'
+    batch_subfolder  = 'swg_hd_batch'
     comfy_input.mkdir(parents=True, exist_ok=True)
-    comfy_output.mkdir(parents=True, exist_ok=True)
+    (comfy_output_root / batch_subfolder).mkdir(parents=True, exist_ok=True)
 
     tpl = json.loads(WORKFLOW_TPL.read_text(encoding='utf-8'))
     tpl.pop('_comment', None)
@@ -338,8 +461,8 @@ def phase_upscale(args, cfg: dict) -> int:
 
     todo = []
     for png in in_dir.glob('*.png'):
-        # We rename the SaveImage output back to <original>.png on the way out,
-        # so a finished file is simply out_dir / png.name.
+        # A finished file is simply out_dir / png.name - our save node
+        # writes under the original filename, no counter/prefix guessing.
         if (out_dir / png.name).exists() and not args.overwrite:
             continue
         todo.append(png)
@@ -348,65 +471,91 @@ def phase_upscale(args, cfg: dict) -> int:
     if not todo:
         return 0
 
-    def process_one(src_png: Path) -> tuple[str, str | None]:
-        # Stage the input into ComfyUI/input/swg/ (same drive = hard link / copy).
-        staged = comfy_input / src_png.name
-        if not staged.exists():
-            try:
-                os.link(src_png, staged)
-            except OSError:
-                staged.write_bytes(src_png.read_bytes())
+    dims = load_png_dims(Path(args.staging), todo)
+    missing_dims = [p for p in todo if p not in dims]
+    if missing_dims:
+        print(f'  WARN {len(missing_dims)} files have no manifest entry, skipping '
+              f'(e.g. {missing_dims[0].name})', file=sys.stderr)
 
-        # Build the per-file workflow from template.
+    batches = build_upscale_batches(dims, args.batch_pixel_budget)
+    sizes_seen = sorted({dims[b[0]] for b in batches})
+    print(f'  {len(batches)} batches across {len(sizes_seen)} distinct sizes '
+          f'(pixel budget={args.batch_pixel_budget:,})')
+
+    def attempt(batch: list[Path]) -> list[tuple[str, str | None]]:
+        """Submit one same-size batch and check its outputs. Called directly
+        by process_batch below, and again (on smaller sub-batches) by
+        retry_shrinking if this batch fails - most likely a VRAM OOM at
+        this size, since the upscale workflow is all-or-nothing per graph
+        execution.
+        """
+        names = [p.name for p in batch]
+
+        # Stage inputs into ComfyUI/input/swg/ (same drive = hard link / copy).
+        for p in batch:
+            staged = comfy_input / p.name
+            if not staged.exists():
+                try:
+                    os.link(p, staged)
+                except OSError:
+                    staged.write_bytes(p.read_bytes())
+
         wf = json.loads(json.dumps(tpl))  # deep copy
-        wf['1']['inputs']['image'] = f'swg/{src_png.name}'
+        wf['1']['inputs']['filenames'] = '\n'.join(f'swg/{n}' for n in names)
         wf['2']['inputs']['model_name'] = cfg['upscale_model']
-        wf['4']['inputs']['filename_prefix'] = f'swg_hd/{src_png.stem}'
+        wf['4']['inputs']['filenames'] = '\n'.join(names)
+        wf['4']['inputs']['subfolder'] = batch_subfolder
 
         try:
             prompt_id = submit_workflow(api, wf, client_id)
+            wait_for_prompt(api, prompt_id, timeout=args.timeout)
+        except TimeoutError as e:
+            # Giving up on the poll doesn't cancel the job server-side -
+            # interrupt it so it isn't still running/queued when we (or a
+            # split retry) submit the next thing.
+            comfy_interrupt(api)
+            return [(n, f'TIMEOUT: {e}') for n in names]
         except Exception as e:
-            return (src_png.name, f'submit failed: {e}')
+            return [(n, f'batch submit/poll failed: {e}') for n in names]
 
-        try:
-            entry = wait_for_prompt(api, prompt_id, timeout=args.timeout)
-        except Exception as e:
-            return (src_png.name, f'timeout/poll failed: {e}')
+        # We control the exact output filenames ourselves (SWGSaveImageBatch
+        # writes each slot under its real name), so there's no SaveImage
+        # prefix+counter metadata to parse - just check disk directly, same
+        # "truth is on disk" approach as decode/encode.
+        results = []
+        for n in names:
+            src = comfy_output_root / batch_subfolder / n
+            results.append((n, None) if src.exists() else (n, f'batch output missing: {src}'))
+        return results
 
-        # Find SaveImage's output and stash it under our original name
-        # (SaveImage appends a counter like _00001_; we throw that away so
-        # phase_encode sees deterministic <orig_stem>.png filenames).
-        save_node_outputs = entry.get('outputs', {}).get('4', {}).get('images', [])
-        if not save_node_outputs:
-            return (src_png.name, 'no SaveImage output')
-        # Just take the first image; our workflow only produces one.
-        img = save_node_outputs[0]
-        src = Path(cfg['comfy_root']) / 'output' / img.get('subfolder', '') / img['filename']
-        if not src.exists():
-            return (src_png.name, f'output file missing: {src}')
-        dst = out_dir / src_png.name
-        if dst.exists() and args.overwrite:
-            dst.unlink()
-        if not dst.exists():
-            try:
-                os.link(src, dst)
-            except OSError:                    # cross-drive, perms, etc.
-                dst.write_bytes(src.read_bytes())
-        return (src_png.name, None)
+    def process_batch(batch: list[Path]) -> list[tuple[str, str | None]]:
+        return retry_shrinking(batch, attempt)
 
-    # GPU is the bottleneck; 1 outstanding prompt is usually right, but ComfyUI
-    # queues internally so a small parallel-submit count keeps the queue warm.
+    # --workers now controls concurrent BATCH submissions, not concurrent
+    # files - each batch already carries many files, so keeping ComfyUI's
+    # queue fed between batch completions matters less than it did per-file.
     ok = bad = 0
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        for fname, err in (r.result() for r in [pool.submit(process_one, p) for p in todo]):
-            if err:
-                bad += 1
-                print(f'  FAIL {fname}: {err}', file=sys.stderr)
-            else:
+        futures = [pool.submit(process_batch, b) for b in batches]
+        for fut in as_completed(futures):
+            for name, err in fut.result():
+                if err:
+                    bad += 1
+                    print(f'  FAIL {name}: {err}', file=sys.stderr)
+                    continue
+                src = comfy_output_root / batch_subfolder / name
+                dst = out_dir / name
+                if dst.exists() and args.overwrite:
+                    dst.unlink()
+                if not dst.exists():
+                    try:
+                        os.link(src, dst)
+                    except OSError:                # cross-drive, perms, etc.
+                        dst.write_bytes(src.read_bytes())
                 ok += 1
             done = ok + bad
-            if done % 25 == 0 or done == len(todo):
+            if done % 250 == 0 or done == len(todo):
                 rate = done / max(0.001, time.time() - t0)
                 eta  = (len(todo) - done) / max(0.001, rate)
                 print(f'  upscaled {done}/{len(todo)}  rate={rate:.2f}/s  eta={eta/60:.1f}min')
@@ -428,6 +577,13 @@ def restore_alpha(png_out: Path, png_in_dir: Path) -> bool:
     and merge it in (overwriting png_out; idempotent). Returns True if fixed.
     """
     from PIL import Image
+    # These are our own already-generated textures, not untrusted uploads -
+    # PIL's decompression-bomb guard exists for the latter and false-positives
+    # on legitimately large upscaled output (e.g. a 4096x4096 source becomes
+    # 16384x16384 = 268,435,456px at 4x, well past the default 178,956,970
+    # limit). Cheap to set on every call; only matters that it's set before
+    # the Image.open() calls below.
+    Image.MAX_IMAGE_PIXELS = None
     src_png = png_in_dir / png_out.name
     if not src_png.exists():
         return False
@@ -446,6 +602,21 @@ def restore_alpha(png_out: Path, png_in_dir: Path) -> bool:
     return True
 
 
+def restore_alpha_safe(png_out: Path, png_in_dir: Path) -> tuple[str, bool, str | None]:
+    """Wraps restore_alpha so one bad file (corrupt PNG, unexpectedly huge
+    texture, etc.) can't take down the whole ProcessPoolExecutor.map() call
+    in phase_encode - a single exception from any worker otherwise re-raises
+    when the results are iterated, aborting encode entirely including the
+    texconv batching that hasn't even started yet. The rest of this pipeline
+    tolerates individual failures and reports them; this should too.
+    """
+    try:
+        fixed = restore_alpha(png_out, png_in_dir)
+        return (png_out.name, fixed, None)
+    except Exception as e:
+        return (png_out.name, False, repr(e))
+
+
 def phase_encode(args, cfg: dict) -> int:
     if not TEXCONV.exists():
         raise SystemExit(f'texconv not found at {TEXCONV}')
@@ -456,12 +627,10 @@ def phase_encode(args, cfg: dict) -> int:
     out_dir = Path(args.staging) / 'dds_out' / 'texture'
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Group PNGs by target texconv format so we can batch one process per format.
-    # phase_upscale already renamed outputs back to <orig_stem>.png, so the
-    # manifest key is simply <png.stem>.dds.
-    by_fmt: dict[str, list[Path]] = {}
+    # First pass: figure out which files actually need work (manifest lookup
+    # + skip-existing), without doing any CPU work yet.
+    pending: list[tuple[Path, str, str]] = []   # (png, dds_name, tex_fmt)
     skipped = 0
-    alpha_fixed = 0
     for png in in_dir.glob('*.png'):
         dds_name = png.stem + '.dds'
         meta = manifest['entries'].get(dds_name)
@@ -473,37 +642,86 @@ def phase_encode(args, cfg: dict) -> int:
         if target.exists() and not args.overwrite:
             skipped += 1
             continue
-        if restore_alpha(png, png_in_dir):
-            alpha_fixed += 1
+        pending.append((png, dds_name, tex_fmt))
+
+    # restore_alpha is pure per-file CPU work (PIL Lanczos resize + channel
+    # merge) with no shared state between files, so fan it out across
+    # processes instead of doing it inline one file at a time — it was
+    # previously the one fully-serial step sitting in front of the batching
+    # below. ProcessPoolExecutor (not threads) because we want real
+    # parallelism here regardless of how much of PIL's C code releases the
+    # GIL.
+    alpha_fixed = 0
+    alpha_errors = 0
+    if pending:
+        with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            results = pool.map(restore_alpha_safe,
+                                [p for p, _dn, _f in pending],
+                                [png_in_dir] * len(pending))
+            for name, fixed, err in results:
+                if err:
+                    alpha_errors += 1
+                    print(f'  WARN restore_alpha failed for {name}: {err}', file=sys.stderr)
+                elif fixed:
+                    alpha_fixed += 1
+        if alpha_errors:
+            print(f'  {alpha_errors} files failed alpha restore (proceeding to encode anyway; '
+                  f'those files keep whatever alpha ComfyUI gave them)', file=sys.stderr)
+
+    # Group by target texconv format so we can batch one process per format.
+    # phase_upscale already renamed outputs back to <orig_stem>.png, so the
+    # manifest key is simply <png.stem>.dds.
+    by_fmt: dict[str, list[tuple[Path, str]]] = {}
+    for png, dds_name, tex_fmt in pending:
         by_fmt.setdefault(tex_fmt, []).append((png, dds_name))
 
-    print(f'[encode] {sum(len(v) for v in by_fmt.values())} PNG -> DDS  '
+    print(f'[encode] {len(pending)} PNG -> DDS  '
           f'({skipped} skipped existing, {alpha_fixed} source alphas re-attached)')
 
     BATCH = 100
     t0 = time.time()
-    total_attempted = 0
     all_targets: list[Path] = []   # used for source-of-truth presence check
     for tex_fmt, items in by_fmt.items():
         print(f'  [{tex_fmt}] {len(items)} files')
-        for i in range(0, len(items), BATCH):
-            chunk = items[i:i+BATCH]
-            # texconv -f <fmt> -m 0 (full chain) -o <dir> input1 input2 ...
-            # -sepalpha: filter alpha independently of color when generating
-            # mips; texconv's default alpha-weighted filter darkens color in
-            # low-alpha regions on lower mips (dark-at-distance bug).
-            cmd = [
-                str(TEXCONV),
-                '-nologo',
-                '-y',
-                '-f', tex_fmt,
-                '-m', '0',                 # full mipmap chain at new (4x) size
-                '-sepalpha',
-                '-ft', 'dds',
-                '-o', str(out_dir),
-            ] + [str(p) for (p, _name) in chunk]
+        chunks = [items[i:i + BATCH] for i in range(0, len(items), BATCH)]
+
+        # BC7's compressor already spreads a single file's block compression
+        # across every core (DirectXTex uses hardware_concurrency() by
+        # default), so running many BC7 texconv processes at once just makes
+        # them fight over cores — cap concurrency low and let each one use
+        # the whole machine. Every other format compresses fast per file
+        # with little internal threading, so run -singleproc, workers-wide:
+        # one file's worth of work per core instead of per texconv
+        # invocation, which is what was leaving most of a 9950X idle before.
+        heavy = tex_fmt in SELF_THREADED_TEXCONV_FORMATS
+        chunk_workers = min(len(chunks), 3) if heavy else max(1, args.workers)
+
+        # texconv -f <fmt> -m 0 (full chain) -o <dir> input1 input2 ...
+        # -sepalpha: filter alpha independently of color when generating
+        # mips; texconv's default alpha-weighted filter darkens color in
+        # low-alpha regions on lower mips (dark-at-distance bug).
+        base_cmd = [
+            str(TEXCONV),
+            '-nologo',
+            '-y',
+            '-f', tex_fmt,
+            '-m', '0',                 # full mipmap chain at new (4x) size
+            '-sepalpha',
+            '-ft', 'dds',
+            '-o', str(out_dir),
+        ]
+        if not heavy:
+            base_cmd.append('-singleproc')
+
+        def run_chunk(chunk):
+            cmd = base_cmd + [str(p) for (p, _name) in chunk]
             rc = subprocess.call(cmd, stdout=subprocess.DEVNULL)
-            total_attempted += len(chunk)
+            return rc, chunk
+
+        with ThreadPoolExecutor(max_workers=chunk_workers) as pool:
+            chunk_results = list(pool.map(run_chunk, chunks))
+
+        for rc, chunk in chunk_results:
             if rc != 0:
                 print(f'    WARN texconv rc={rc} on chunk starting '
                       f'{chunk[0][0].name} (checking outputs)', file=sys.stderr)
@@ -575,7 +793,7 @@ def phase_repack(args, cfg: dict) -> int:
                   f'({shard_path.stat().st_size/1024/1024:.0f} MB)')
             continue
 
-        w = TreWriter(str(shard_path))
+        w = TreWriter(str(shard_path), workers=args.workers)
         for f in entries_in_shard:
             rel = f.relative_to(in_dir).as_posix()
             w.add(DiskFileEntry(name=rel, disk_path=str(f), try_compress=True))
@@ -623,7 +841,14 @@ def main(argv=None) -> int:
     ap.add_argument('--out-tre', default=None,
                     help='output archive path (default: <tre stem>_hd.tre next to the source)')
     ap.add_argument('--workers', type=int, default=4)
-    ap.add_argument('--timeout', type=float, default=300.0, help='per-prompt timeout in seconds')
+    ap.add_argument('--batch-pixel-budget', type=int, default=DEFAULT_BATCH_PIXEL_BUDGET,
+                    help='upscale phase: max width*height*count per ComfyUI batch '
+                         f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 128 files at 256x256, '
+                         'scaled down for larger textures) - raise/lower to fit your VRAM')
+    ap.add_argument('--timeout', type=float, default=900.0,
+                    help='per-batch prompt timeout in seconds (default 900 = 15min; '
+                         'batches now carry many files per prompt, not one, so this needs '
+                         'more headroom than the old single-file default of 300)')
     ap.add_argument('--overwrite', action='store_true')
     ap.add_argument('phase', choices=['extract', 'decode', 'upscale', 'encode', 'repack', 'all'])
     args = ap.parse_args(argv)

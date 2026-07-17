@@ -37,7 +37,7 @@ import subprocess
 import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from PIL import Image
@@ -355,10 +355,70 @@ def _img_stats(arr):
     return float(arr[:, :, :3].mean()), float(arr[:, :, 3].mean())
 
 
-def cmd_qc(args) -> int:
+def _qc_one(dds_path: Path, cat: str, method_override: str | None, tmp_dir: Path,
+           fallback: bool) -> tuple[str, bool, str | None]:
+    """Worker-process body for one texture's QC check. Runs in a separate
+    process so the texconv decode subprocess + numpy diff work actually
+    spreads across cores. Each worker gets its own tmp subdir (keyed by pid)
+    so concurrent decode_dds calls can't clash on the same output filename.
+    """
     import numpy as np
     from quality_gate import decode_dds          # reuse the texconv decode
 
+    base = dds_path.name
+    plan = CATEGORY_PLAN.get(cat, CATEGORY_PLAN['hardsurface'])
+    method = method_override or plan['method']
+    if method == 'copy':                       # untouched originals always pass
+        return base, True, None
+
+    src_png = PNG_IN / (Path(base).stem + '.png')
+    worker_tmp = tmp_dir / f'w{os.getpid()}'
+    worker_tmp.mkdir(parents=True, exist_ok=True)
+    out_png = decode_dds(dds_path, worker_tmp)
+    if out_png is None or not src_png.exists():
+        return base, True, None                # can't judge -> keep
+
+    reason = None
+    try:
+        src = Image.open(src_png).convert('RGBA')
+        out = Image.open(out_png).convert('RGBA')
+        a = np.asarray(src.resize(out.size, Image.LANCZOS), dtype=np.int16)
+        b = np.asarray(out, dtype=np.int16)
+        sb, sa = _img_stats(a)
+        ob, oa = _img_stats(b)
+        # method-agnostic corruption checks (the splotch guards)
+        if ob < 5 and sb > 30:
+            reason = f'solid_black ({sb:.0f}->{ob:.1f})'
+        elif sb > 30 and ob < sb * 0.5:
+            reason = f'brightness_drop ({sb:.0f}->{ob:.0f})'
+        elif sa > 240 and oa < 200:
+            reason = f'alpha_corruption ({sa:.0f}->{oa:.0f})'
+        elif sa > 30 and oa < sa * 0.5:
+            reason = f'alpha_dropped ({sa:.0f}->{oa:.0f})'
+        elif sa < 235 and oa > 250:                # transparent source -> opaque output
+            reason = f'alpha_filled ({sa:.0f}->{oa:.0f})'
+        # Lanczos-deviation checks only for the Lanczos path
+        elif method == 'lanczos':
+            diff = np.abs(a[:, :, :3] - b[:, :, :3])
+            if diff.mean() > 15.0:
+                reason = f'high_mean_diff ({diff.mean():.1f})'
+            elif (diff.max(axis=2) > 100).mean() > 0.002:
+                reason = f'extreme_pixels ({(diff.max(axis=2)>100).mean()*100:.2f}%)'
+    except Exception as e:
+        reason = f'exception:{e!r}'
+    finally:
+        try: out_png.unlink()
+        except OSError: pass
+
+    if reason is not None and fallback:            # overwrite with the untouched original
+        src_dds = DDS_IN / base
+        if src_dds.exists():
+            dds_path.write_bytes(src_dds.read_bytes())
+
+    return base, reason is None, reason
+
+
+def cmd_qc(args) -> int:
     cats = json.loads(CATEGORIES_JSON.read_text(encoding='utf-8'))
     base2cat = {b: c for c, lst in cats.items() for b in lst}
 
@@ -374,64 +434,24 @@ def cmd_qc(args) -> int:
     from collections import Counter
     reasons = Counter()
 
-    for i, dds in enumerate(files, 1):
-        base = dds.name
-        cat = base2cat.get(base, 'hardsurface')
-        plan = CATEGORY_PLAN.get(cat, CATEGORY_PLAN['hardsurface'])
-        method = args.method or plan['method']
-        if method == 'copy':                       # untouched originals always pass
-            passed += 1
-            continue
+    done = 0
+    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [
+            pool.submit(_qc_one, dds, base2cat.get(dds.name, 'hardsurface'),
+                        args.method, tmp, args.fallback)
+            for dds in files
+        ]
+        for fut in as_completed(futures):
+            base, ok, reason = fut.result()
+            done += 1
+            if ok:
+                passed += 1
+            else:
+                failed.append((base, reason))
+                reasons[reason.split(' ')[0]] += 1
 
-        src_png = PNG_IN / (Path(base).stem + '.png')
-        out_png = decode_dds(dds, tmp)
-        if out_png is None or not src_png.exists():
-            passed += 1                            # can't judge -> keep
-            continue
-        try:
-            src = Image.open(src_png).convert('RGBA')
-            out = Image.open(out_png).convert('RGBA')
-            a = np.asarray(src.resize(out.size, Image.LANCZOS), dtype=np.int16)
-            b = np.asarray(out, dtype=np.int16)
-            sb, sa = _img_stats(a)
-            ob, oa = _img_stats(b)
-            reason = None
-            # method-agnostic corruption checks (the splotch guards)
-            if ob < 5 and sb > 30:
-                reason = f'solid_black ({sb:.0f}->{ob:.1f})'
-            elif sb > 30 and ob < sb * 0.5:
-                reason = f'brightness_drop ({sb:.0f}->{ob:.0f})'
-            elif sa > 240 and oa < 200:
-                reason = f'alpha_corruption ({sa:.0f}->{oa:.0f})'
-            elif sa > 30 and oa < sa * 0.5:
-                reason = f'alpha_dropped ({sa:.0f}->{oa:.0f})'
-            elif sa < 235 and oa > 250:                # transparent source -> opaque output
-                reason = f'alpha_filled ({sa:.0f}->{oa:.0f})'
-            # Lanczos-deviation checks only for the Lanczos path
-            elif method == 'lanczos':
-                diff = np.abs(a[:, :, :3] - b[:, :, :3])
-                if diff.mean() > 15.0:
-                    reason = f'high_mean_diff ({diff.mean():.1f})'
-                elif (diff.max(axis=2) > 100).mean() > 0.002:
-                    reason = f'extreme_pixels ({(diff.max(axis=2)>100).mean()*100:.2f}%)'
-        except Exception as e:
-            reason = f'exception:{e!r}'
-        finally:
-            try: out_png.unlink()
-            except OSError: pass
-
-        if reason is None:
-            passed += 1
-        else:
-            failed.append((base, reason))
-            reasons[reason.split(' ')[0]] += 1
-            if args.fallback:                      # overwrite with the untouched original
-                src_dds = DDS_IN / base
-                if src_dds.exists():
-                    dds.write_bytes(src_dds.read_bytes())
-
-        if i % 500 == 0 or i == len(files):
-            print(f'  qc {i}/{len(files)}  pass={passed} fail={len(failed)}')
+            if done % 500 == 0 or done == len(files):
+                print(f'  qc {done}/{len(files)}  pass={passed} fail={len(failed)}')
 
     report = {'variant': args.variant, 'total': len(files), 'passed': passed,
               'failed': len(failed), 'reasons': dict(reasons.most_common()),
@@ -501,6 +521,8 @@ def main(argv=None) -> int:
     q.add_argument('--variant', default='main')
     q.add_argument('--method', choices=['lanczos', 'comfy', 'copy'], help='force a check mode (default: per-category)')
     q.add_argument('--fallback', action='store_true', help='overwrite failed outputs with the original DDS')
+    q.add_argument('--workers', type=int, default=os.cpu_count() or 4,
+                   help='parallel QC worker processes (default: cpu_count)')
 
     p = sub.add_parser('pack', help='build TRE shard(s) from a render variant')
     p.add_argument('--variant', default='main')

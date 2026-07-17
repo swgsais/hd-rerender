@@ -34,6 +34,7 @@ import os
 import struct
 import sys
 import zlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 # Importing swg_crc triggers its self-test - if the CRC algorithm is wrong
@@ -92,6 +93,29 @@ class DiskFileEntry:
     try_compress: bool = True
 
 
+def _compress_disk_file(disk_path: str, name: str, crc: int, try_compress: bool):
+    """Worker-process body: read a loose file, optionally zlib-compress it
+    (kept compressed only if it actually shrinks), and md5 the on-disk
+    bytes. Pure compute + local I/O, no reference to the output archive, so
+    it's safe to run in a separate process. Must stay a module-level
+    function so it's picklable for spawn-based multiprocessing.
+    """
+    with open(disk_path, 'rb') as fh:
+        raw = fh.read()
+    uncomp_len = len(raw)
+    if try_compress and uncomp_len > 0:
+        compressed = zlib.compress(raw, level=_ZLIB_LEVEL)
+        if len(compressed) < uncomp_len:
+            payload, compressor = compressed, CT_ZLIB
+        else:
+            payload, compressor = raw, CT_NONE
+    else:
+        payload, compressor = raw, CT_NONE
+    resolved_crc = crc if crc else swg_crc.calc_path(name)
+    md5 = hashlib.md5(payload).digest()
+    return name, resolved_crc, uncomp_len, compressor, payload, md5
+
+
 @dataclass
 class _Prepared:
     """Internal: a staged entry with its final on-disk metadata recorded."""
@@ -105,9 +129,13 @@ class _Prepared:
 
 
 class TreWriter:
-    def __init__(self, output_path: str):
+    def __init__(self, output_path: str, workers: int | None = None):
         self.output_path = output_path
         self.entries: list = []   # PassThroughEntry | DiskFileEntry
+        # DiskFileEntry prep (read + zlib level 9 + md5) is pure per-file CPU
+        # work with no shared state, so it runs in a process pool; defaults
+        # to one worker per core.
+        self.workers = workers or os.cpu_count() or 4
 
     def add(self, entry) -> None:
         self.entries.append(entry)
@@ -147,9 +175,33 @@ class TreWriter:
             for i in pt_indices:
                 prepared[i] = self._write_passthrough(out, self.entries[i])
 
-            for i, e in enumerate(self.entries):
-                if isinstance(e, DiskFileEntry):
-                    prepared[i] = self._write_disk_file(out, e)
+            # DiskFileEntry prep is the CPU-heavy part (read + zlib -9 +
+            # md5), so it's farmed out to a process pool. The actual writes
+            # to `out` still happen here, sequentially in original entry
+            # order, so output offsets stay deterministic across reruns
+            # regardless of which worker finishes first.
+            disk_indices = [i for i, e in enumerate(self.entries)
+                            if isinstance(e, DiskFileEntry)]
+            if disk_indices:
+                max_workers = min(len(disk_indices), self.workers)
+                results: dict[int, tuple] = {}
+                with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {
+                        pool.submit(_compress_disk_file,
+                                    self.entries[i].disk_path,
+                                    self.entries[i].name,
+                                    self.entries[i].crc,
+                                    self.entries[i].try_compress): i
+                        for i in disk_indices
+                    }
+                    for fut in as_completed(futures):
+                        results[futures[fut]] = fut.result()
+                for i in disk_indices:
+                    name, crc, uncomp_len, compressor, payload, md5 = results[i]
+                    offset = out.tell()
+                    out.write(payload)
+                    prepared[i] = _Prepared(name, crc, uncomp_len, compressor,
+                                            len(payload), offset, md5)
 
             # ---- 3. Name block. ----
             name_buf = bytearray()
@@ -222,29 +274,6 @@ class TreWriter:
             remaining -= len(chunk)
         return _Prepared(e.name, e.crc, e.uncomp_len, e.compressor,
                          e.src_disk_len, offset, digest.digest())
-
-    @staticmethod
-    def _write_disk_file(out, e: DiskFileEntry) -> _Prepared:
-        with open(e.disk_path, 'rb') as fh:
-            raw = fh.read()
-        uncomp_len = len(raw)
-        if e.try_compress and uncomp_len > 0:
-            compressed = zlib.compress(raw, level=_ZLIB_LEVEL)
-            if len(compressed) < uncomp_len:
-                payload = compressed
-                compressor = CT_ZLIB
-            else:
-                payload = raw
-                compressor = CT_NONE
-        else:
-            payload = raw
-            compressor = CT_NONE
-        crc = e.crc if e.crc else swg_crc.calc_path(e.name)
-        offset = out.tell()
-        out.write(payload)
-        return _Prepared(e.name, crc, uncomp_len, compressor, len(payload),
-                         offset, hashlib.md5(payload).digest())
-
 
 if __name__ == '__main__':
     print('build_tre.py is a library; use repack_retail.py or import TreWriter.',

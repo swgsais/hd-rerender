@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -73,6 +75,9 @@ def lanczos_upscale_one(src: Path, out_dir: Path, scale: int = 4) -> bool:
         str(TEXCONV),
         '-nologo',
         '-y',
+        '-singleproc',           # one file per invocation; parallelism comes
+                                 # from running many invocations concurrently,
+                                 # not from texconv's own internal threading
         '-w', str(new_w),
         '-h', str(new_h),
         '-if', 'CUBIC',         # Bicubic - standard choice for UPSCALE.
@@ -94,6 +99,8 @@ def main() -> int:
     ap.add_argument('--out-dir',  required=True, help='dir for upscaled DDS output')
     ap.add_argument('--names',    required=False, help='optional JSON file with a list of filenames to process')
     ap.add_argument('--scale',    type=int, default=4)
+    ap.add_argument('--workers',  type=int, default=os.cpu_count() or 4,
+                    help='concurrent texconv processes (default: cpu_count)')
     args = ap.parse_args()
 
     if not TEXCONV.exists():
@@ -110,18 +117,23 @@ def main() -> int:
     else:
         todo = sorted(src_dir.glob('*.dds'))
 
-    print(f'lanczos {args.scale}x: {len(todo)} files {src_dir} -> {out_dir}')
+    print(f'lanczos {args.scale}x: {len(todo)} files {src_dir} -> {out_dir}  '
+          f'(workers={args.workers})')
     t0 = time.time()
     ok = bad = 0
-    for i, p in enumerate(todo, 1):
-        if lanczos_upscale_one(p, out_dir, args.scale):
-            ok += 1
-        else:
-            bad += 1
-        if i % 50 == 0 or i == len(todo):
-            rate = i / max(0.001, time.time() - t0)
-            eta = (len(todo) - i) / max(0.001, rate)
-            print(f'  {i}/{len(todo)}  {rate:.1f} files/s  eta {eta:.0f}s')
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [pool.submit(lanczos_upscale_one, p, out_dir, args.scale) for p in todo]
+        for fut in as_completed(futures):
+            if fut.result():
+                ok += 1
+            else:
+                bad += 1
+            done += 1
+            if done % 50 == 0 or done == len(todo):
+                rate = done / max(0.001, time.time() - t0)
+                eta = (len(todo) - done) / max(0.001, rate)
+                print(f'  {done}/{len(todo)}  {rate:.1f} files/s  eta {eta:.0f}s')
     print(f'done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
     return 0 if bad == 0 else 1
 
