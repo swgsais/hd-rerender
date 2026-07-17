@@ -180,28 +180,36 @@ class TreWriter:
             # to `out` still happen here, sequentially in original entry
             # order, so output offsets stay deterministic across reruns
             # regardless of which worker finishes first.
+            #
+            # Work is submitted in bounded waves so peak RAM is one wave of
+            # compressed payloads, not the whole shard — payloads ride back
+            # through pickle and would otherwise all sit in memory until the
+            # pool drained (multi-GB peaks on a 1.6 GiB shard).
             disk_indices = [i for i, e in enumerate(self.entries)
                             if isinstance(e, DiskFileEntry)]
             if disk_indices:
                 max_workers = min(len(disk_indices), self.workers)
-                results: dict[int, tuple] = {}
+                wave_size = max_workers * 4
                 with ProcessPoolExecutor(max_workers=max_workers) as pool:
-                    futures = {
-                        pool.submit(_compress_disk_file,
-                                    self.entries[i].disk_path,
-                                    self.entries[i].name,
-                                    self.entries[i].crc,
-                                    self.entries[i].try_compress): i
-                        for i in disk_indices
-                    }
-                    for fut in as_completed(futures):
-                        results[futures[fut]] = fut.result()
-                for i in disk_indices:
-                    name, crc, uncomp_len, compressor, payload, md5 = results[i]
-                    offset = out.tell()
-                    out.write(payload)
-                    prepared[i] = _Prepared(name, crc, uncomp_len, compressor,
-                                            len(payload), offset, md5)
+                    for w in range(0, len(disk_indices), wave_size):
+                        wave = disk_indices[w:w + wave_size]
+                        futures = {
+                            pool.submit(_compress_disk_file,
+                                        self.entries[i].disk_path,
+                                        self.entries[i].name,
+                                        self.entries[i].crc,
+                                        self.entries[i].try_compress): i
+                            for i in wave
+                        }
+                        results: dict[int, tuple] = {}
+                        for fut in as_completed(futures):
+                            results[futures[fut]] = fut.result()
+                        for i in wave:
+                            name, crc, uncomp_len, compressor, payload, md5 = results[i]
+                            offset = out.tell()
+                            out.write(payload)
+                            prepared[i] = _Prepared(name, crc, uncomp_len, compressor,
+                                                    len(payload), offset, md5)
 
             # ---- 3. Name block. ----
             name_buf = bytearray()

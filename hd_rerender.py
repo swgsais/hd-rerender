@@ -159,6 +159,29 @@ def load_manifest(path: Path) -> dict:
     return {'entries': {}}
 
 
+# Texture buckets that must never be AI-upscaled (see categorize.py): the
+# engine reads them as structured data, not imagery. Upscaled versions of
+# these are what corrupted load screens, character face tinting, and sky
+# gradients in-game.
+EXCLUDED_CATEGORIES = ('cube', 'special', 'ui')
+
+
+def load_excluded_names(staging: Path) -> set[str]:
+    """DDS basenames the pipeline must not upscale or ship. Reads
+    categories.json written by phase_extract; for older staging dirs that
+    predate it, categorizes on the fly from the manifest."""
+    cat_path = staging / 'categories.json'
+    if cat_path.exists():
+        cats = json.loads(cat_path.read_text(encoding='utf-8'))
+    else:
+        from categorize import categorize
+        src_dir = staging / 'dds_in' / 'texture'
+        cats = {}
+        for name in load_manifest(staging / 'manifest.json')['entries']:
+            cats.setdefault(categorize(name, src_dir / name), []).append(name)
+    return {n for k in EXCLUDED_CATEGORIES for n in cats.get(k, [])}
+
+
 def save_manifest(path: Path, manifest: dict) -> None:
     tmp = path.with_suffix('.json.tmp')
     with tmp.open('w', encoding='utf-8') as f:
@@ -208,6 +231,26 @@ def phase_extract(args, cfg: dict) -> int:
     print('[extract] format distribution:')
     for fmt, n in sorted(fmt_counts.items(), key=lambda kv: -kv[1]):
         print(f'    {fmt:8s} {n:6d}')
+
+    # Category routing. Cube maps, UI atlases, and channel-data textures
+    # (normals/masks, gradient LUTs, customization patterns) are data the
+    # engine reads structurally, not imagery — AI-upscaling them corrupts
+    # load screens, character face tinting, and sky gradients in-game.
+    # Later phases skip these buckets entirely; the client falls back to the
+    # original archive for those entries.
+    from categorize import categorize
+    cats: dict[str, list[str]] = {k: [] for k in
+                                  ('cube', 'special', 'ui', 'arch', 'organic', 'hardsurface')}
+    for name in manifest['entries']:
+        cats[categorize(name, out_dir / 'texture' / name)].append(name)
+    for k in cats:
+        cats[k].sort()
+    (Path(args.staging) / 'categories.json').write_text(
+        json.dumps(cats, indent=0), encoding='utf-8')
+    print('[extract] category routing:')
+    for k, v in cats.items():
+        skip = '   -> skipped (engine data, ships as original)' if k in EXCLUDED_CATEGORIES else ''
+        print(f'    {k:12s} {len(v):6d}{skip}')
     return 0
 
 
@@ -227,12 +270,17 @@ def phase_decode(args, cfg: dict) -> int:
     # single bad file in a 200-batch can't poison the chunk's exit code.
     manifest = load_manifest(Path(args.staging) / 'manifest.json')
     valid_names = set(manifest['entries'].keys())
+    excluded = load_excluded_names(Path(args.staging))
 
     todo = []
     skipped_unknown = 0
+    skipped_excluded = 0
     for dds in in_dir.glob('*.dds'):
         if dds.name not in valid_names:
             skipped_unknown += 1
+            continue
+        if dds.name in excluded:
+            skipped_excluded += 1
             continue
         png = out_dir / (dds.stem + '.png')
         if png.exists() and not args.overwrite:
@@ -240,7 +288,7 @@ def phase_decode(args, cfg: dict) -> int:
         todo.append(dds)
 
     print(f'[decode] {len(todo)} DDS -> PNG  (workers={args.workers}, '
-          f'{skipped_unknown} non-DDS files skipped)')
+          f'{skipped_unknown} non-DDS + {skipped_excluded} engine-data files skipped)')
     if not todo:
         return 0
 
@@ -418,10 +466,12 @@ def retry_shrinking(batch: list[Path], attempt) -> list[tuple[str, str | None]]:
     by_name = {p.name: p for p in batch}
     results = [(n, e) for n, e in outcomes if e is None]
     failed = [(n, e) for n, e in outcomes if e is not None]
+    # Timeouts are always final, even when mixed with other failures in the
+    # same batch — only the non-timeout subset is worth re-splitting.
+    results += [(n, e) for n, e in failed if e.startswith('TIMEOUT: ')]
+    failed = [(n, e) for n, e in failed if not e.startswith('TIMEOUT: ')]
     if not failed:
         return results
-    if all(e.startswith('TIMEOUT: ') for _n, e in failed):
-        return results + failed
     if len(failed) == 1:
         n, e = failed[0]
         return results + [(n, f'{e} (size-1, no further retry possible)')]
@@ -459,15 +509,35 @@ def phase_upscale(args, cfg: dict) -> int:
     except Exception as e:
         raise SystemExit(f'cannot reach ComfyUI at {api}: {e}')
 
+    # The batch workflow depends on our custom nodes; fail once with install
+    # instructions instead of letting every /prompt bounce on an unknown
+    # class_type.
+    try:
+        node_info = comfy_get_json(api, '/object_info/SWGLoadImageBatch')
+    except Exception:
+        node_info = {}
+    if 'SWGLoadImageBatch' not in node_info:
+        raise SystemExit(
+            'ComfyUI is running but the SWG batch nodes are not loaded.\n'
+            f'Copy {THIS_DIR / "comfyui_custom_nodes" / "swg_batch_io.py"} into\n'
+            f'{Path(cfg["comfy_root"]) / "custom_nodes"}\\ and restart ComfyUI.'
+        )
+
+    excluded = load_excluded_names(Path(args.staging))
     todo = []
+    skipped_excluded = 0
     for png in in_dir.glob('*.png'):
         # A finished file is simply out_dir / png.name - our save node
         # writes under the original filename, no counter/prefix guessing.
+        if (png.stem + '.dds') in excluded:      # stale decode from an older run
+            skipped_excluded += 1
+            continue
         if (out_dir / png.name).exists() and not args.overwrite:
             continue
         todo.append(png)
 
-    print(f'[upscale] {len(todo)} PNG -> HD PNG via ComfyUI ({api}, model={cfg["upscale_model"]})')
+    print(f'[upscale] {len(todo)} PNG -> HD PNG via ComfyUI ({api}, model={cfg["upscale_model"]}, '
+          f'{skipped_excluded} engine-data files skipped)')
     if not todo:
         return 0
 
@@ -531,12 +601,16 @@ def phase_upscale(args, cfg: dict) -> int:
     def process_batch(batch: list[Path]) -> list[tuple[str, str | None]]:
         return retry_shrinking(batch, attempt)
 
-    # --workers now controls concurrent BATCH submissions, not concurrent
-    # files - each batch already carries many files, so keeping ComfyUI's
-    # queue fed between batch completions matters less than it did per-file.
+    # ONE batch in flight at a time. comfy_interrupt (fired on timeout)
+    # cancels whatever ComfyUI is currently executing — with concurrent
+    # submissions that is most likely some OTHER submission's healthy batch,
+    # so a single timeout would cascade into killing good work. Batches are
+    # already sized to saturate the GPU on their own; --workers still drives
+    # the CPU-bound phases.
+    total = sum(len(b) for b in batches)
     ok = bad = 0
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:
         futures = [pool.submit(process_batch, b) for b in batches]
         for fut in as_completed(futures):
             for name, err in fut.result():
@@ -555,10 +629,10 @@ def phase_upscale(args, cfg: dict) -> int:
                         dst.write_bytes(src.read_bytes())
                 ok += 1
             done = ok + bad
-            if done % 250 == 0 or done == len(todo):
+            if done % 250 == 0 or done == total:
                 rate = done / max(0.001, time.time() - t0)
-                eta  = (len(todo) - done) / max(0.001, rate)
-                print(f'  upscaled {done}/{len(todo)}  rate={rate:.2f}/s  eta={eta/60:.1f}min')
+                eta  = (total - done) / max(0.001, rate)
+                print(f'  upscaled {done}/{total}  rate={rate:.2f}/s  eta={eta/60:.1f}min')
 
     print(f'[upscale] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
     # Tolerate a few per-file failures (huge textures, transient model OOM)
@@ -629,10 +703,15 @@ def phase_encode(args, cfg: dict) -> int:
 
     # First pass: figure out which files actually need work (manifest lookup
     # + skip-existing), without doing any CPU work yet.
+    excluded = load_excluded_names(Path(args.staging))
     pending: list[tuple[Path, str, str]] = []   # (png, dds_name, tex_fmt)
     skipped = 0
+    skipped_excluded = 0
     for png in in_dir.glob('*.png'):
         dds_name = png.stem + '.dds'
+        if dds_name in excluded:                 # stale upscale from an older run
+            skipped_excluded += 1
+            continue
         meta = manifest['entries'].get(dds_name)
         if not meta:
             print(f'  WARN no manifest entry for {png.name} (key={dds_name})', file=sys.stderr)
@@ -676,7 +755,8 @@ def phase_encode(args, cfg: dict) -> int:
         by_fmt.setdefault(tex_fmt, []).append((png, dds_name))
 
     print(f'[encode] {len(pending)} PNG -> DDS  '
-          f'({skipped} skipped existing, {alpha_fixed} source alphas re-attached)')
+          f'({skipped} skipped existing, {skipped_excluded} engine-data skipped, '
+          f'{alpha_fixed} source alphas re-attached)')
 
     BATCH = 100
     t0 = time.time()
@@ -757,7 +837,15 @@ def phase_repack(args, cfg: dict) -> int:
     SHARD_TARGET_BYTES = int(1.6 * 1024 * 1024 * 1024)   # 1.6 GiB raw
 
     # Sort by name for deterministic, reproducible sharding across reruns.
-    files = sorted(in_dir.rglob('*.dds'))
+    # Engine-data textures (cube/special/ui buckets) never ship in the HD
+    # archive — drop any strays left in dds_out by runs that predate the
+    # category routing, so a rebuild also repairs old staging in place.
+    excluded = load_excluded_names(Path(args.staging))
+    files = sorted(f for f in in_dir.rglob('*.dds') if f.name not in excluded)
+    n_dropped = sum(1 for f in in_dir.rglob('*.dds')) - len(files)
+    if n_dropped:
+        print(f'[repack] dropping {n_dropped} engine-data files from the archive '
+              f'(client falls back to originals)')
     if not files:
         raise SystemExit(f'[repack] no DDS files found under {in_dir}')
 

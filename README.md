@@ -36,6 +36,16 @@ order).
 Every phase is **resumable**. Re-running skips outputs that already exist.
 Run individual phases for diagnosis, or `all` for the full pipeline.
 
+**Category routing:** `extract` buckets every texture via `categorize.py` and
+writes `staging/categories.json`. The `cube`, `special`, and `ui` buckets
+(cube maps, normal/spec/mask channel data, gradient LUTs, customization
+patterns, UI atlases, load screens) are **never upscaled or shipped** — the
+engine reads those as structured data, and upscaled versions corrupt load
+screens, character face tinting, and sky gradients in-game. The client falls
+back to the original archive for them. `repack` also drops any strays left in
+`dds_out` by runs that predate this routing, so re-running `repack` alone
+repairs an old staging dir in place.
+
 ## One-time setup
 
 ### 1. texconv.exe

@@ -83,6 +83,18 @@ ORGANIC_CONTAINS = (
 UI_PREFIXES = ('ui_', 'cursor', 'pt_', 'fx_', 'lod_')
 UI_CONTAINS = ('cursor',)
 
+SPECIAL_PREFIXES = (
+    'grad_',     # gradient LUT strips (sky color ramps, etc.) - the engine
+                 # samples these as lookup data; upscaling shifts the ramp
+    'skybox_',   # skybox faces authored without the cube-map header flag
+)
+SPECIAL_CONTAINS = (
+    '_pattern',  # character face/body customization index patterns - the
+                 # palette system reads these as indices, not imagery
+    'gradient',  # gradient LUTs (gradient_sky1, sw_gradient_*, ...)
+    '_grad.',    # gradient LUTs named as a suffix (glass_grad.dds etc.)
+)
+
 SPECIAL_SUFFIX_RE = re.compile(
     r'_(n[0-9]?|s[0-9]?|norm|normal|spec|spc|det|a|b|d|e|g|h|m|hue)\.dds$',
     re.IGNORECASE,
@@ -119,6 +131,10 @@ def categorize(name: str, src_path: Path) -> str:
 
     # 3) Special channel data (normal/spec/alpha mask/etc.) - hard skip
     if SPECIAL_SUFFIX_RE.search(nl):
+        return 'special'
+    if any(nl.startswith(p) for p in SPECIAL_PREFIXES):
+        return 'special'
+    if any(c in nl for c in SPECIAL_CONTAINS):
         return 'special'
 
     # 4) Organic - DAT2
