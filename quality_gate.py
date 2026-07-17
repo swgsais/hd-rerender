@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -113,6 +115,52 @@ def filename_skip(name: str) -> str | None:
     return None
 
 
+def _reason_key(reason: str) -> str:
+    """Group a reason string the same way regardless of which check produced
+    it: 'solid_black (30->1)' -> 'solid_black', 'suffix:_cn.dds' -> 'suffix'.
+    """
+    if '(' in reason:
+        return reason.split('(', 1)[0].strip()
+    return reason.split(':', 1)[0]
+
+
+def _check_one(name: str, bic_dir: Path, src_dir: Path, src_png_dir: Path,
+               tmp_dir: Path) -> tuple[str, bool, str]:
+    """Worker-process body: run the full per-file QC check. Each worker gets
+    its own tmp subdir (keyed by pid) so concurrent decode_dds calls can
+    never clash on the same output filename.
+    """
+    skip = filename_skip(name)
+    if skip:
+        return name, False, skip
+
+    worker_tmp = tmp_dir / f'w{os.getpid()}'
+    worker_tmp.mkdir(parents=True, exist_ok=True)
+
+    bic_dds = bic_dir / name
+    src_png = src_png_dir / (Path(name).stem + '.png')
+    if not bic_dds.exists():
+        return name, False, 'no_bicubic_output'
+    if not src_png.exists():
+        src_png = decode_dds(src_dir / name, worker_tmp)
+        if src_png is None:
+            return name, False, 'src_decode_failed'
+
+    v4_png = decode_dds(bic_dds, worker_tmp)
+    if v4_png is None:
+        return name, False, 'v4_decode_failed'
+
+    try:
+        ok, reason, _stats = quality_check(src_png, v4_png)
+    except Exception as e:
+        ok, reason = False, f'exception:{e!r}'
+    finally:
+        try: v4_png.unlink()
+        except OSError: pass
+
+    return name, ok, reason
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--bicubic-dir', required=True, help='dir with v4 bicubic DDS outputs')
@@ -121,6 +169,8 @@ def main() -> int:
     ap.add_argument('--tmp-dir',     required=True, help='scratch dir for v4 PNG decodes')
     ap.add_argument('--names',       required=True, help='JSON list of filenames to check')
     ap.add_argument('--report',      required=True, help='output JSON report path')
+    ap.add_argument('--workers',     type=int, default=os.cpu_count() or 4,
+                    help='parallel worker processes (default: cpu_count)')
     args = ap.parse_args()
 
     bic_dir = Path(args.bicubic_dir)
@@ -131,60 +181,31 @@ def main() -> int:
 
     with open(args.names, 'r', encoding='utf-8') as f:
         names = json.load(f)
-    print(f'Quality gate on {len(names)} files')
+    print(f'Quality gate on {len(names)} files  (workers={args.workers})')
 
     passed: list[str] = []
     failed: list[tuple[str, str]] = []
     failures_by_reason: dict[str, int] = {}
 
     t0 = time.time()
-    for i, name in enumerate(names, 1):
-        skip = filename_skip(name)
-        if skip:
-            failed.append((name, skip))
-            key = skip.split(':')[0]
-            failures_by_reason[key] = failures_by_reason.get(key, 0) + 1
-            continue
-        bic_dds = bic_dir / name
-        src_png = src_png_dir / (Path(name).stem + '.png')
-        if not bic_dds.exists():
-            failed.append((name, 'no_bicubic_output'))
-            failures_by_reason['no_bicubic_output'] = failures_by_reason.get('no_bicubic_output', 0) + 1
-            continue
-        if not src_png.exists():
-            # Decode source on the fly if not pre-cached
-            src_dds = src_dir / name
-            src_png = decode_dds(src_dds, tmp_dir)
-            if src_png is None:
-                failed.append((name, 'src_decode_failed'))
-                continue
+    done = 0
+    with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = [pool.submit(_check_one, name, bic_dir, src_dir, src_png_dir, tmp_dir)
+                  for name in names]
+        for fut in as_completed(futures):
+            name, ok, reason = fut.result()
+            done += 1
+            if ok:
+                passed.append(name)
+            else:
+                failed.append((name, reason))
+                key = _reason_key(reason)
+                failures_by_reason[key] = failures_by_reason.get(key, 0) + 1
 
-        v4_png = decode_dds(bic_dds, tmp_dir)
-        if v4_png is None:
-            failed.append((name, 'v4_decode_failed'))
-            failures_by_reason['v4_decode_failed'] = failures_by_reason.get('v4_decode_failed', 0) + 1
-            continue
-
-        try:
-            ok, reason, _stats = quality_check(src_png, v4_png)
-        except Exception as e:
-            ok, reason = False, f'exception:{e!r}'
-        finally:
-            # Cleanup v4 PNG (source PNG comes from staging/png_in/, leave alone)
-            try: v4_png.unlink()
-            except OSError: pass
-
-        if ok:
-            passed.append(name)
-        else:
-            failed.append((name, reason))
-            key = reason.split('(', 1)[0].strip()
-            failures_by_reason[key] = failures_by_reason.get(key, 0) + 1
-
-        if i % 250 == 0 or i == len(names):
-            rate = i / max(0.001, time.time() - t0)
-            eta  = (len(names) - i) / max(0.001, rate)
-            print(f'  {i}/{len(names)}  {rate:.1f} files/s  eta {eta:.0f}s  passed={len(passed)} failed={len(failed)}')
+            if done % 250 == 0 or done == len(names):
+                rate = done / max(0.001, time.time() - t0)
+                eta  = (len(names) - done) / max(0.001, rate)
+                print(f'  {done}/{len(names)}  {rate:.1f} files/s  eta {eta:.0f}s  passed={len(passed)} failed={len(failed)}')
 
     report = {
         'summary': {

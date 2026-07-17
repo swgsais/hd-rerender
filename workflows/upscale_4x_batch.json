@@ -1,0 +1,30 @@
+{
+  "_comment": "ComfyUI /prompt API workflow: load a batch of same-size PNGs -> ESRGAN upscale -> save the batch back out under each slot's original filename. Requires the SWGLoadImageBatch/SWGSaveImageBatch custom nodes (custom_nodes/swg_batch_io.py). Placeholders {INPUT_FILENAMES}, {OUTPUT_FILENAMES}, {OUTPUT_SUBFOLDER}, and {MODEL_NAME} are substituted by hd_rerender.py before submission. {INPUT_FILENAMES}/{OUTPUT_FILENAMES} are newline-separated lists, one entry per batch slot, in matching order.",
+  "1": {
+    "class_type": "SWGLoadImageBatch",
+    "inputs": {
+      "filenames": "{INPUT_FILENAMES}"
+    }
+  },
+  "2": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "{MODEL_NAME}"
+    }
+  },
+  "3": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": ["2", 0],
+      "image": ["1", 0]
+    }
+  },
+  "4": {
+    "class_type": "SWGSaveImageBatch",
+    "inputs": {
+      "images": ["3", 0],
+      "filenames": "{OUTPUT_FILENAMES}",
+      "subfolder": "{OUTPUT_SUBFOLDER}"
+    }
+  }
+}
