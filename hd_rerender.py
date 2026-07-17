@@ -275,6 +275,7 @@ def phase_decode(args, cfg: dict) -> int:
     todo = []
     skipped_unknown = 0
     skipped_excluded = 0
+    skipped_toobig = 0
     for dds in in_dir.glob('*.dds'):
         if dds.name not in valid_names:
             skipped_unknown += 1
@@ -282,13 +283,23 @@ def phase_decode(args, cfg: dict) -> int:
         if dds.name in excluded:
             skipped_excluded += 1
             continue
+        # Sources already at/above --max-source-dim never reach the upscale
+        # phase (see phase_upscale) - skip decoding them here too so a huge
+        # texture doesn't burn texconv time/disk turning into a PNG we're
+        # just going to discard a moment later. Keeps the cap enforced as
+        # early in the pipeline as possible, same as encode/repack already do.
+        meta = manifest['entries'].get(dds.name)
+        if meta is not None and max(meta['width'], meta['height']) > args.max_source_dim:
+            skipped_toobig += 1
+            continue
         png = out_dir / (dds.stem + '.png')
         if png.exists() and not args.overwrite:
             continue
         todo.append(dds)
 
     print(f'[decode] {len(todo)} DDS -> PNG  (workers={args.workers}, '
-          f'{skipped_unknown} non-DDS + {skipped_excluded} engine-data files skipped)')
+          f'{skipped_unknown} non-DDS + {skipped_excluded} engine-data + '
+          f'{skipped_toobig} >{args.max_source_dim}px files skipped)')
     if not todo:
         return 0
 
@@ -407,22 +418,46 @@ def comfy_interrupt(api: str) -> None:
 # crossing ~6.3GB / 38% on a 16GB card - retry_shrinking() below is the
 # safety net if this still overshoots on some batch, so keep raising this
 # (and re-checking peak VRAM) as long as there's clear headroom.
-DEFAULT_BATCH_PIXEL_BUDGET = 256 * 256 * 128
+DEFAULT_BATCH_PIXEL_BUDGET = 256 * 256 * 512
+
+
+def read_png_dims(path: Path) -> tuple[int, int]:
+    """Width/height straight out of the PNG signature + IHDR chunk (first 24
+    bytes) - same struct-unpack approach as read_dds_meta above, and much
+    cheaper across thousands of files than routing through PIL's full
+    Image.open plugin dispatch just to read two integers.
+    """
+    with path.open('rb') as f:
+        head = f.read(24)
+    if len(head) < 24 or head[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError(f'{path}: not a PNG file')
+    return struct.unpack('>II', head[16:24])
 
 
 def load_png_dims(staging: Path, todo: list[Path]) -> dict[Path, tuple[int, int]]:
-    """Look up each PNG's (width, height) from manifest.json, keyed by its
-    corresponding source <stem>.dds entry. Reads the manifest fresh every
-    call rather than hardcoding a size list, so batch grouping automatically
-    tracks whatever the current texture set actually contains.
+    """Real on-disk (width, height) for each PNG that has a manifest entry.
+
+    Batches must be grouped by what's actually in the PNG file, not by the
+    manifest's recorded width/height for its source DDS: phase_extract only
+    ever writes a manifest entry once (`if key in manifest['entries']:
+    continue`) and phase_decode skips re-decoding an existing PNG, so a
+    leftover/stale png_in file can silently disagree with a since-updated
+    manifest entry. Grouping by the stale manifest number put a
+    differently-sized image in a same-size batch and crashed
+    SWGLoadImageBatch, which validates the real image bytes. Files with no
+    manifest entry at all are still excluded - phase_encode has nothing to
+    re-encode them to.
     """
     manifest = load_manifest(staging / 'manifest.json')
     entries = manifest['entries']
     dims: dict[Path, tuple[int, int]] = {}
     for p in todo:
-        meta = entries.get(p.stem + '.dds')
-        if meta is not None:
-            dims[p] = (meta['width'], meta['height'])
+        if entries.get(p.stem + '.dds') is None:
+            continue
+        try:
+            dims[p] = read_png_dims(p)
+        except Exception as e:
+            print(f'  WARN {p.name}: cannot read PNG dims: {e}', file=sys.stderr)
     return dims
 
 
@@ -480,7 +515,7 @@ def retry_shrinking(batch: list[Path], attempt) -> list[tuple[str, str | None]]:
     mid = len(failed_batch) // 2
     print(f'  [upscale] {len(failed_batch)}/{len(batch)} failed in a batch '
           f'({failed[0][1]}), retrying as batches of {mid} and {len(failed_batch)-mid}',
-          file=sys.stderr)
+          file=sys.stderr, flush=True)
     return (results
             + retry_shrinking(failed_batch[:mid], attempt)
             + retry_shrinking(failed_batch[mid:], attempt))
@@ -572,13 +607,29 @@ def phase_upscale(args, cfg: dict) -> int:
         names = [p.name for p in batch]
 
         # Stage inputs into ComfyUI/input/swg/ (same drive = hard link / copy).
+        # comfy_input lives inside the ComfyUI install, not our own staging/
+        # or output/ dirs, so it survives across unrelated runs (different
+        # archive, older version of this one). A same-named leftover there
+        # from a prior run would otherwise never get refreshed, so we can't
+        # just trust staged.exists() like before. But re-staging is cheap
+        # only when os.link succeeds (same-drive hardlink, an O(1) metadata
+        # op) - on a cross-drive ComfyUI install it falls back to a full
+        # read+write copy, and unconditionally redoing that for every batch
+        # attempt (including retries and resumed runs where the file was
+        # already staged correctly) adds real I/O for nothing. A size check
+        # is a single cheap stat() and still catches the actual failure mode
+        # (a differently-sized leftover) without repeating the expensive path
+        # when nothing has changed.
         for p in batch:
             staged = comfy_input / p.name
-            if not staged.exists():
-                try:
-                    os.link(p, staged)
-                except OSError:
-                    staged.write_bytes(p.read_bytes())
+            if staged.exists():
+                if staged.stat().st_size == p.stat().st_size:
+                    continue
+                staged.unlink()
+            try:
+                os.link(p, staged)
+            except OSError:
+                staged.write_bytes(p.read_bytes())
 
         wf = json.loads(json.dumps(tpl))  # deep copy
         wf['1']['inputs']['filenames'] = '\n'.join(f'swg/{n}' for n in names)
@@ -623,10 +674,12 @@ def phase_upscale(args, cfg: dict) -> int:
     with ThreadPoolExecutor(max_workers=1) as pool:
         futures = [pool.submit(process_batch, b) for b in batches]
         for fut in as_completed(futures):
+            batch_ok = batch_bad = 0
             for name, err in fut.result():
                 if err:
                     bad += 1
-                    print(f'  FAIL {name}: {err}', file=sys.stderr)
+                    batch_bad += 1
+                    print(f'  FAIL {name}: {err}', file=sys.stderr, flush=True)
                     continue
                 src = comfy_output_root / batch_subfolder / name
                 dst = out_dir / name
@@ -638,11 +691,16 @@ def phase_upscale(args, cfg: dict) -> int:
                     except OSError:                # cross-drive, perms, etc.
                         dst.write_bytes(src.read_bytes())
                 ok += 1
+                batch_ok += 1
+            # One line per completed batch, regardless of --batch-pixel-budget
+            # (a large batch might otherwise go minutes with no output; a
+            # small one would spam under the old every-250-files gate).
             done = ok + bad
-            if done % 250 == 0 or done == total:
-                rate = done / max(0.001, time.time() - t0)
-                eta  = (total - done) / max(0.001, rate)
-                print(f'  upscaled {done}/{total}  rate={rate:.2f}/s  eta={eta/60:.1f}min')
+            rate = done / max(0.001, time.time() - t0)
+            eta  = (total - done) / max(0.001, rate)
+            print(f'  batch done: {batch_ok} ok, {batch_bad} failed  |  '
+                  f'overall {done}/{total}  rate={rate:.2f}/s  eta={eta/60:.1f}min',
+                  flush=True)
 
     print(f'[upscale] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
     # Tolerate a few per-file failures (huge textures, transient model OOM)
