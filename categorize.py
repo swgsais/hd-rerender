@@ -41,9 +41,6 @@ ARCHITECTURAL_PREFIXES = (
     'bldg_',                                    # buildings
     'dirt_', 'mud_', 'sand_', 'snow_',          # ground surfaces
     'door_', 'gate_',                           # architectural elements
-    'env_',                                     # environment (most are cube maps)
-    'cloudtile_',                               # skybox tiles
-    'sky_',                                     # sky textures
     'ptch_',                                    # terrain patches
     'tatt_',                                    # tatooine biome
     'tato_',                                    # tatooine architecture
@@ -93,7 +90,18 @@ SPECIAL_CONTAINS = (
                  # palette system reads these as indices, not imagery
     'gradient',  # gradient LUTs (gradient_sky1, sw_gradient_*, ...)
     '_grad.',    # gradient LUTs named as a suffix (glass_grad.dds etc.)
+    '_face',     # species face/head diffuse - tinted through the palette
+    '_head',     # system at runtime; resampling shifts the index colors.
+                 # Costs a few safe skips (weapon "_head" parts etc.) but
+                 # face corruption is far worse than a non-HD vibroblade.
 )
+
+# Skydome imagery: not palette data, but the arch bucket's Lanczos-only
+# warning applies double here - AI upscalers hallucinate texture into what
+# must stay a smooth atmospheric gradient. Shipped at original resolution.
+SKY_PREFIXES  = ('sky_', 'cloudtile_', 'env_')
+SKY_CONTAINS  = ('_sky_', '_sky.')
+SKY_NOT       = ('skyskraper', 'skyscraper', 'skyhook')   # buildings, not sky
 
 SPECIAL_SUFFIX_RE = re.compile(
     r'_(n[0-9]?|s[0-9]?|norm|normal|spec|spc|det|a|b|d|e|g|h|m|hue)\.dds$',
@@ -137,6 +145,13 @@ def categorize(name: str, src_path: Path) -> str:
     if any(c in nl for c in SPECIAL_CONTAINS):
         return 'special'
 
+    # 3b) Skydome / atmosphere - hard skip (AI hallucinates into gradients)
+    if not any(g in nl for g in SKY_NOT):
+        if any(nl.startswith(p) for p in SKY_PREFIXES):
+            return 'sky'
+        if any(c in nl for c in SKY_CONTAINS):
+            return 'sky'
+
     # 4) Organic - DAT2
     if any(nl.startswith(p) for p in ORGANIC_PREFIXES):
         return 'organic'
@@ -166,7 +181,7 @@ def main() -> int:
         manifest = json.load(f)
 
     cats: dict[str, list[str]] = {
-        'cube': [], 'special': [], 'ui': [],
+        'cube': [], 'special': [], 'ui': [], 'sky': [],
         'arch': [], 'organic': [], 'hardsurface': [],
     }
     for name in manifest['entries']:

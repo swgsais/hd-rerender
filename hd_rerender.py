@@ -163,7 +163,7 @@ def load_manifest(path: Path) -> dict:
 # engine reads them as structured data, not imagery. Upscaled versions of
 # these are what corrupted load screens, character face tinting, and sky
 # gradients in-game.
-EXCLUDED_CATEGORIES = ('cube', 'special', 'ui')
+EXCLUDED_CATEGORIES = ('cube', 'special', 'ui', 'sky')
 
 
 def load_excluded_names(staging: Path) -> set[str]:
@@ -240,7 +240,7 @@ def phase_extract(args, cfg: dict) -> int:
     # original archive for those entries.
     from categorize import categorize
     cats: dict[str, list[str]] = {k: [] for k in
-                                  ('cube', 'special', 'ui', 'arch', 'organic', 'hardsurface')}
+                                  ('cube', 'special', 'ui', 'sky', 'arch', 'organic', 'hardsurface')}
     for name in manifest['entries']:
         cats[categorize(name, out_dir / 'texture' / name)].append(name)
     for k in cats:
@@ -547,6 +547,16 @@ def phase_upscale(args, cfg: dict) -> int:
         print(f'  WARN {len(missing_dims)} files have no manifest entry, skipping '
               f'(e.g. {missing_dims[0].name})', file=sys.stderr)
 
+    # Sources already at/above --max-source-dim gain almost nothing from AI
+    # upscaling but dominate render time and archive size (a 2048 source at
+    # 4x is a 128+ MB DDS). They ship as originals via client fallback.
+    too_big = [p for p in list(dims) if max(dims[p]) > args.max_source_dim]
+    for p in too_big:
+        del dims[p]
+    if too_big:
+        print(f'  {len(too_big)} sources > {args.max_source_dim}px skipped '
+              f'(already high-res; ship as originals)')
+
     batches = build_upscale_batches(dims, args.batch_pixel_budget)
     sizes_seen = sorted({dims[b[0]] for b in batches})
     print(f'  {len(batches)} batches across {len(sizes_seen)} distinct sizes '
@@ -643,50 +653,52 @@ def phase_upscale(args, cfg: dict) -> int:
 # ---------------------------------------------------------------------------
 # Phase 4: encode PNG -> DDS via texconv, using manifest for original format.
 
-def restore_alpha(png_out: Path, png_in_dir: Path) -> bool:
-    """ComfyUI's SaveImage writes RGB only, so the source alpha is lost —
-    which turns alpha-cut foliage/glass/decals into opaque quads showing the
-    texture's background color. If the source PNG carries a real alpha
-    channel and the upscaled PNG doesn't, Lanczos-upscale the source alpha
-    and merge it in (overwriting png_out; idempotent). Returns True if fixed.
+def prepare_ship_png(png_out: Path, png_in_dir: Path, ship_png: Path,
+                     target_wh: tuple[int, int]) -> tuple[str, bool, str | None]:
+    """Turn a raw 4x render into the PNG we actually encode and ship:
+
+    - Lanczos-downscale to target_wh (source dims * --ship-scale, capped at
+      --max-dim). Shipping the raw 4x quadrupled archive size for detail the
+      engine never resolves on screen; render-4x-then-ship-2x is the recipe
+      the composite-armor pilot validated against SWGRestoration.
+    - Re-attach the source alpha channel (ComfyUI's save path is RGB-only;
+      lost alpha turns alpha-cut foliage/glass/decals into opaque quads).
+
+    Runs in a worker process; exceptions are returned, not raised, so one
+    corrupt file can't abort the whole encode phase.
+    Returns (name, alpha_attached, error|None).
     """
     from PIL import Image
-    # These are our own already-generated textures, not untrusted uploads -
-    # PIL's decompression-bomb guard exists for the latter and false-positives
-    # on legitimately large upscaled output (e.g. a 4096x4096 source becomes
-    # 16384x16384 = 268,435,456px at 4x, well past the default 178,956,970
-    # limit). Cheap to set on every call; only matters that it's set before
-    # the Image.open() calls below.
+    # Our own generated textures, not untrusted uploads - the decompression
+    # bomb guard false-positives on legitimately large 4x renders.
     Image.MAX_IMAGE_PIXELS = None
-    src_png = png_in_dir / png_out.name
-    if not src_png.exists():
-        return False
-    src = Image.open(src_png)
-    if src.mode not in ('RGBA', 'LA') and 'transparency' not in src.info:
-        return False
-    src_a = src.convert('RGBA').split()[3]
-    if src_a.getextrema()[0] == 255:        # fully opaque source
-        return False
-    out = Image.open(png_out)
-    if out.mode == 'RGBA' and out.split()[3].getextrema()[0] < 255:
-        return False                        # upscaled alpha already present
-    rgb = out.convert('RGB')
-    a = src_a.resize(rgb.size, Image.LANCZOS)
-    Image.merge('RGBA', (*rgb.split(), a)).save(png_out)
-    return True
-
-
-def restore_alpha_safe(png_out: Path, png_in_dir: Path) -> tuple[str, bool, str | None]:
-    """Wraps restore_alpha so one bad file (corrupt PNG, unexpectedly huge
-    texture, etc.) can't take down the whole ProcessPoolExecutor.map() call
-    in phase_encode - a single exception from any worker otherwise re-raises
-    when the results are iterated, aborting encode entirely including the
-    texconv batching that hasn't even started yet. The rest of this pipeline
-    tolerates individual failures and reports them; this should too.
-    """
     try:
-        fixed = restore_alpha(png_out, png_in_dir)
-        return (png_out.name, fixed, None)
+        img = Image.open(png_out)
+        tw, th = target_wh
+        # Never enlarge beyond what the model actually rendered.
+        if img.width < tw or img.height < th:
+            tw, th = img.width, img.height
+        rgb = img.convert('RGB')
+        if (rgb.width, rgb.height) != (tw, th):
+            rgb = rgb.resize((tw, th), Image.LANCZOS)
+
+        # Alpha: prefer a real alpha already present on the render, else
+        # lift the source's alpha; fully-opaque channels are dropped.
+        alpha = None
+        if img.mode == 'RGBA' and img.split()[3].getextrema()[0] < 255:
+            alpha = img.split()[3].resize((tw, th), Image.LANCZOS)
+        else:
+            src_png = png_in_dir / png_out.name
+            if src_png.exists():
+                src = Image.open(src_png)
+                if src.mode in ('RGBA', 'LA') or 'transparency' in src.info:
+                    a = src.convert('RGBA').split()[3]
+                    if a.getextrema()[0] < 255:
+                        alpha = a.resize((tw, th), Image.LANCZOS)
+
+        out = Image.merge('RGBA', (*rgb.split(), alpha)) if alpha else rgb
+        out.save(ship_png)
+        return (png_out.name, alpha is not None, None)
     except Exception as e:
         return (png_out.name, False, repr(e))
 
@@ -701,10 +713,13 @@ def phase_encode(args, cfg: dict) -> int:
     out_dir = Path(args.staging) / 'dds_out' / 'texture'
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    ship_dir = Path(args.staging) / 'png_ship'
+    ship_dir.mkdir(parents=True, exist_ok=True)
+
     # First pass: figure out which files actually need work (manifest lookup
     # + skip-existing), without doing any CPU work yet.
     excluded = load_excluded_names(Path(args.staging))
-    pending: list[tuple[Path, str, str]] = []   # (png, dds_name, tex_fmt)
+    pending: list[tuple[Path, str, str, tuple[int, int]]] = []   # (png, dds_name, tex_fmt, target_wh)
     skipped = 0
     skipped_excluded = 0
     for png in in_dir.glob('*.png'):
@@ -716,46 +731,51 @@ def phase_encode(args, cfg: dict) -> int:
         if not meta:
             print(f'  WARN no manifest entry for {png.name} (key={dds_name})', file=sys.stderr)
             continue
+        if max(meta['width'], meta['height']) > args.max_source_dim:
+            skipped_excluded += 1                # stale render of a high-res source
+            continue
         tex_fmt = TEXCONV_FORMAT.get(meta['fmt'], 'BC3_UNORM')
         target = out_dir / dds_name
         if target.exists() and not args.overwrite:
             skipped += 1
             continue
-        pending.append((png, dds_name, tex_fmt))
+        target_wh = (min(meta['width'] * args.ship_scale, args.max_dim),
+                     min(meta['height'] * args.ship_scale, args.max_dim))
+        pending.append((png, dds_name, tex_fmt, target_wh))
 
-    # restore_alpha is pure per-file CPU work (PIL Lanczos resize + channel
-    # merge) with no shared state between files, so fan it out across
-    # processes instead of doing it inline one file at a time — it was
-    # previously the one fully-serial step sitting in front of the batching
-    # below. ProcessPoolExecutor (not threads) because we want real
-    # parallelism here regardless of how much of PIL's C code releases the
-    # GIL.
+    # Ship-prep (downscale to ship size + alpha re-attach) is pure per-file
+    # CPU work with no shared state, so fan it out across processes.
     alpha_fixed = 0
-    alpha_errors = 0
+    prep_errors = 0
+    prep_failed: set[str] = set()
     if pending:
         with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            results = pool.map(restore_alpha_safe,
-                                [p for p, _dn, _f in pending],
-                                [png_in_dir] * len(pending))
+            results = pool.map(prepare_ship_png,
+                               [p for p, _dn, _f, _t in pending],
+                               [png_in_dir] * len(pending),
+                               [ship_dir / p.name for p, _dn, _f, _t in pending],
+                               [t for _p, _dn, _f, t in pending])
             for name, fixed, err in results:
                 if err:
-                    alpha_errors += 1
-                    print(f'  WARN restore_alpha failed for {name}: {err}', file=sys.stderr)
+                    prep_errors += 1
+                    prep_failed.add(name)
+                    print(f'  WARN ship-prep failed for {name}: {err}', file=sys.stderr)
                 elif fixed:
                     alpha_fixed += 1
-        if alpha_errors:
-            print(f'  {alpha_errors} files failed alpha restore (proceeding to encode anyway; '
-                  f'those files keep whatever alpha ComfyUI gave them)', file=sys.stderr)
+        if prep_errors:
+            print(f'  {prep_errors} files failed ship-prep and are skipped this run',
+                  file=sys.stderr)
 
     # Group by target texconv format so we can batch one process per format.
-    # phase_upscale already renamed outputs back to <orig_stem>.png, so the
-    # manifest key is simply <png.stem>.dds.
+    # Encode reads the prepared PNGs in png_ship/, not the raw 4x renders.
     by_fmt: dict[str, list[tuple[Path, str]]] = {}
-    for png, dds_name, tex_fmt in pending:
-        by_fmt.setdefault(tex_fmt, []).append((png, dds_name))
+    for png, dds_name, tex_fmt, _t in pending:
+        if png.name in prep_failed:
+            continue
+        by_fmt.setdefault(tex_fmt, []).append((ship_dir / png.name, dds_name))
 
-    print(f'[encode] {len(pending)} PNG -> DDS  '
-          f'({skipped} skipped existing, {skipped_excluded} engine-data skipped, '
+    print(f'[encode] {sum(len(v) for v in by_fmt.values())} PNG -> DDS  '
+          f'({skipped} skipped existing, {skipped_excluded} engine-data/high-res skipped, '
           f'{alpha_fixed} source alphas re-attached)')
 
     BATCH = 100
@@ -837,15 +857,30 @@ def phase_repack(args, cfg: dict) -> int:
     SHARD_TARGET_BYTES = int(1.6 * 1024 * 1024 * 1024)   # 1.6 GiB raw
 
     # Sort by name for deterministic, reproducible sharding across reruns.
-    # Engine-data textures (cube/special/ui buckets) never ship in the HD
-    # archive — drop any strays left in dds_out by runs that predate the
-    # category routing, so a rebuild also repairs old staging in place.
+    # Engine-data textures (cube/special/ui/sky buckets) and high-res
+    # sources never ship in the HD archive — drop any strays left in
+    # dds_out by runs that predate the routing/caps, so a rebuild also
+    # repairs old staging in place.
     excluded = load_excluded_names(Path(args.staging))
-    files = sorted(f for f in in_dir.rglob('*.dds') if f.name not in excluded)
-    n_dropped = sum(1 for f in in_dir.rglob('*.dds')) - len(files)
+    entries = load_manifest(Path(args.staging) / 'manifest.json')['entries']
+
+    def ships(f: Path) -> bool:
+        if f.name in excluded:
+            return False
+        if not entries:            # no manifest to judge by — name filter only
+            return True
+        meta = entries.get(f.name)
+        if meta is None:           # not produced by this pipeline run
+            print(f'[repack] WARN dropping {f.name}: no manifest entry', file=sys.stderr)
+            return False
+        return max(meta['width'], meta['height']) <= args.max_source_dim
+
+    all_dds = list(in_dir.rglob('*.dds'))
+    files = sorted(f for f in all_dds if ships(f))
+    n_dropped = len(all_dds) - len(files)
     if n_dropped:
-        print(f'[repack] dropping {n_dropped} engine-data files from the archive '
-              f'(client falls back to originals)')
+        print(f'[repack] dropping {n_dropped} engine-data/high-res files from the '
+              f'archive (client falls back to originals)')
     if not files:
         raise SystemExit(f'[repack] no DDS files found under {in_dir}')
 
@@ -929,6 +964,21 @@ def main(argv=None) -> int:
     ap.add_argument('--out-tre', default=None,
                     help='output archive path (default: <tre stem>_hd.tre next to the source)')
     ap.add_argument('--workers', type=int, default=4)
+    ap.add_argument('--ship-scale', type=int, default=2,
+                    help='shipped size = source dims x this (default 2). The model still '
+                         'renders at its native 4x; encode Lanczos-downscales to this — '
+                         'the render-4x-ship-2x recipe validated in the composite-armor '
+                         'pilot. Shipping raw 4x quadruples archive size for detail the '
+                         'engine never resolves. Changing this between runs requires '
+                         'encode --overwrite (or deleting dds_out) — already-encoded DDS '
+                         'at the old size otherwise pass the skip-existing check.')
+    ap.add_argument('--max-dim', type=int, default=2048,
+                    help='hard cap on shipped texture width/height (default 2048; some '
+                         'SWG shaders cap at 2048 and larger textures balloon archives)')
+    ap.add_argument('--max-source-dim', type=int, default=512,
+                    help='skip sources larger than this on their longest side (default '
+                         '512). High-res sources gain little from AI upscaling but '
+                         'dominate render time and archive size; they ship as originals.')
     ap.add_argument('--batch-pixel-budget', type=int, default=DEFAULT_BATCH_PIXEL_BUDGET,
                     help='upscale phase: max width*height*count per ComfyUI batch '
                          f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 128 files at 256x256, '

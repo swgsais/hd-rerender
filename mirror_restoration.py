@@ -74,6 +74,7 @@ CATEGORY_PLAN = {
     'special':     {'method': 'copy',    'scale': 1, 'model': None},
     'cube':        {'method': 'copy',    'scale': 1, 'model': None},
     'ui':          {'method': 'copy',    'scale': 1, 'model': None},
+    'sky':         {'method': 'copy',    'scale': 1, 'model': None},  # AI hallucinates into gradients
 }
 
 
