@@ -136,6 +136,28 @@ def read_dds_meta(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Config + manifest helpers.
 
+def tre_stem(src: Path) -> str:
+    """Directory sources (extract_tre handles patch-priority layering across
+    all .tre in it) take the directory name as the stem; single files drop
+    their .tre suffix. Shared with mirror_restoration.py so both tools
+    resolve to the identical default staging dir for the same --tre - no
+    manual copying required between them.
+    """
+    return src.stem if src.is_file() else src.name
+
+
+def resolve_staging(tre: str, staging: str | None) -> Path:
+    """staging/<tre stem>/ next to this script, unless --staging overrides
+    it - the one place this default is computed, so companion tools stay in
+    sync with main()'s own resolution below."""
+    if staging:
+        return Path(staging).resolve()
+    src = Path(tre).resolve()
+    if not src.exists():
+        raise SystemExit(f'--tre path does not exist: {src}')
+    return THIS_DIR / 'staging' / tre_stem(src)
+
+
 def load_config(path: Path) -> dict:
     if not path.exists():
         raise SystemExit(
@@ -1052,9 +1074,7 @@ def main(argv=None) -> int:
     src = Path(args.tre).resolve()
     if not src.exists():
         ap.error(f'--tre path does not exist: {src}')
-    # Directory sources (extract_tre handles patch-priority layering) take the
-    # directory name as the stem; single files drop their .tre suffix.
-    stem = src.stem if src.is_file() else src.name
+    stem = tre_stem(src)
     if args.staging is None:
         args.staging = str(THIS_DIR / 'staging' / stem)
     if args.out_tre is None:
