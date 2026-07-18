@@ -5,8 +5,10 @@ shipped" buckets (cube, special, ui, sky — see EXCLUDED_CATEGORIES in
 hd_rerender.py), with whatever metadata the pipeline already has lying
 around:
 
-  category      - which bucket categorize.py put it in, and why (see
-                  categorize.py's module docstring for the routing rules)
+  category      - which bucket categorize.py put it in
+  reason        - the SPECIFIC rule that fired (e.g. 'contains:mask' or
+                  'prefix:grad_') - a bucket count can hide a single
+                  overly-broad rule behind it; this is what breaks it open
   width/height  - original DDS dimensions (from manifest.json)
   fmt/mips      - original BC format + mip count (from manifest.json)
   filesize      - on-disk size of the extracted DDS, in bytes
@@ -23,12 +25,15 @@ Usage:
   python report_excluded.py --staging staging/reborn_textures \\
       --tre E:/path/reborn_textures.tre --format csv --out excluded.csv
 
+  # "why is special so big?" - counts per matching rule, biggest first
+  python report_excluded.py --staging staging/reborn_textures --category special --format reasons
+
 Reads:
   <staging>/categories.json       - category -> [names]  (categorize.py / phase_extract)
   <staging>/manifest.json         - name -> {width, height, fmt, mips}
   <staging>/dds_in/texture/*.dds  - on-disk file size
 
-Writes: stdout (or --out) in --format {table, json, csv, md} (default table).
+Writes: stdout (or --out) in --format {table, json, csv, md, reasons} (default table).
 """
 from __future__ import annotations
 
@@ -41,7 +46,7 @@ from pathlib import Path
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
 
-from categorize import categorize as categorize_one       # noqa: E402
+from categorize import categorize as categorize_one, categorize_with_reason  # noqa: E402
 from extract_tre import _collect_tre_paths, _open_tre     # noqa: E402
 
 # Same set hd_rerender.py never upscales or ships; kept in sync manually
@@ -129,9 +134,11 @@ def build_records(staging: Path, categories: list[str], tre_src: Path | None) ->
             origin_tre, declared_len = origins.get(name, (None, None))
             if filesize is None:
                 filesize = declared_len
+            _, reason = categorize_with_reason(name, on_disk)
             rows.append({
                 'name': name,
                 'category': cat,
+                'reason': reason,
                 'width': meta.get('width'),
                 'height': meta.get('height'),
                 'fmt': meta.get('fmt'),
@@ -143,9 +150,19 @@ def build_records(staging: Path, categories: list[str], tre_src: Path | None) ->
     return out
 
 
+def write_reasons(records: dict[str, list[dict]], out) -> None:
+    from collections import Counter
+    for cat, rows in records.items():
+        counts = Counter(r['reason'] for r in rows)
+        print(f'\n== {cat}  ({len(rows)} files) ==', file=out)
+        for reason, n in counts.most_common():
+            pct = 100 * n / max(1, len(rows))
+            print(f'  {n:6d}  ({pct:5.1f}%)  {reason}', file=out)
+
+
 def write_table(records: dict[str, list[dict]], out) -> None:
     have_origin = any(r['origin_tre'] for rows in records.values() for r in rows)
-    cols = ['name', 'width', 'height', 'fmt', 'mips', 'filesize']
+    cols = ['name', 'reason', 'width', 'height', 'fmt', 'mips', 'filesize']
     if have_origin:
         cols.append('origin_tre')
     for cat, rows in records.items():
@@ -166,7 +183,7 @@ def write_json(records: dict[str, list[dict]], out) -> None:
 
 
 def write_csv(records: dict[str, list[dict]], out) -> None:
-    fieldnames = ['category', 'name', 'width', 'height', 'fmt', 'mips', 'filesize', 'origin_tre']
+    fieldnames = ['category', 'name', 'reason', 'width', 'height', 'fmt', 'mips', 'filesize', 'origin_tre']
     w = csv.DictWriter(out, fieldnames=fieldnames)
     w.writeheader()
     for rows in records.values():
@@ -176,7 +193,7 @@ def write_csv(records: dict[str, list[dict]], out) -> None:
 
 def write_md(records: dict[str, list[dict]], out) -> None:
     have_origin = any(r['origin_tre'] for rows in records.values() for r in rows)
-    cols = ['name', 'width', 'height', 'fmt', 'mips', 'filesize']
+    cols = ['name', 'reason', 'width', 'height', 'fmt', 'mips', 'filesize']
     if have_origin:
         cols.append('origin_tre')
     for cat, rows in records.items():
@@ -202,7 +219,7 @@ def main(argv=None) -> int:
                     help='repeatable; restrict to specific bucket(s). default: the four '
                          'buckets the pipeline never upscales or ships '
                          f'({", ".join(EXCLUDED_CATEGORIES)})')
-    ap.add_argument('--format', choices=['table', 'json', 'csv', 'md'], default='table')
+    ap.add_argument('--format', choices=['table', 'json', 'csv', 'md', 'reasons'], default='table')
     ap.add_argument('--out', default=None, help='write to this path instead of stdout')
     args = ap.parse_args(argv)
 
@@ -217,7 +234,8 @@ def main(argv=None) -> int:
 
     records = build_records(staging, categories, tre_src)
 
-    writer = {'table': write_table, 'json': write_json, 'csv': write_csv, 'md': write_md}[args.format]
+    writer = {'table': write_table, 'json': write_json, 'csv': write_csv,
+              'md': write_md, 'reasons': write_reasons}[args.format]
     if args.out:
         with open(args.out, 'w', newline='', encoding='utf-8') as f:
             writer(records, f)
