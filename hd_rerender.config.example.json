@@ -1,6 +1,7 @@
 {
-  "_comment": "Copy to hd_rerender.config.json and edit. comfy_root must be the directory containing main.py and the input/, output/, models/ subfolders. upscale_model is the filename of a .pth in models/upscale_models/.",
+  "_comment": "Copy to hd_rerender.config.json and edit. comfy_root must be the directory containing main.py and the input/, output/, models/ subfolders. organic_model/hardsurface_model are the filenames of .pth files in models/upscale_models/ - omit either to use the validated defaults baked into hd_rerender.py (DAT2 for organic, DevianceMIP for hardsurface). upscale_model is a legacy alias that only feeds hardsurface_model, kept for configs written before per-category routing existed.",
   "comfy_root": "C:/ComfyUI_windows_portable/ComfyUI",
   "comfy_api": "http://127.0.0.1:8188",
-  "upscale_model": "4x-UltraSharp.pth"
+  "organic_model": "4x-PBRify_UpscalerDAT2_V1.pth",
+  "hardsurface_model": "4x_BS_DevianceMIP.pth"
 }
