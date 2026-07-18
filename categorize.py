@@ -22,7 +22,6 @@ Writes:
 from __future__ import annotations
 
 import json
-import re
 import struct
 import sys
 from pathlib import Path
@@ -103,11 +102,6 @@ SKY_PREFIXES  = ('sky_', 'cloudtile_', 'env_')
 SKY_CONTAINS  = ('_sky_', '_sky.')
 SKY_NOT       = ('skyskraper', 'skyscraper', 'skyhook')   # buildings, not sky
 
-SPECIAL_SUFFIX_RE = re.compile(
-    r'_(n[0-9]?|s[0-9]?|norm|normal|spec|spc|det|a|b|d|e|g|h|m|hue)\.dds$',
-    re.IGNORECASE,
-)
-
 
 def is_cube(path: Path) -> bool:
     """Check DDS_CAPS2_CUBEMAP flag in 128-byte header."""
@@ -122,50 +116,68 @@ def is_cube(path: Path) -> bool:
         return False
 
 
-def categorize(name: str, src_path: Path) -> str:
+def categorize_with_reason(name: str, src_path: Path) -> tuple[str, str]:
+    """Same routing as categorize(), but also returns which specific rule
+    fired - e.g. 'special'/'contains:mask' vs 'arch'/'prefix:thm_'. Buckets
+    can hide a dominant rule behind a single count; this is what
+    report_excluded.py's --format reasons uses to break one open."""
     nl = name.lower()
 
     # 1) Cube map (header-derived) - hard skip
     if src_path.exists() and is_cube(src_path):
-        return 'cube'
+        return 'cube', 'dds_cubemap_flag'
 
     # 2) UI / cursor / particle - hard skip
-    if any(nl.startswith(p) for p in UI_PREFIXES):
-        return 'ui'
-    if any(c in nl for c in UI_CONTAINS):
-        return 'ui'
-    if 'mask' in nl or 'facenormal' in nl:
-        return 'special'
+    for p in UI_PREFIXES:
+        if nl.startswith(p):
+            return 'ui', f'prefix:{p}'
+    for c in UI_CONTAINS:
+        if c in nl:
+            return 'ui', f'contains:{c}'
+    if 'mask' in nl:
+        return 'special', 'contains:mask'
+    if 'facenormal' in nl:
+        return 'special', 'contains:facenormal'
 
     # 3) Special channel data (normal/spec/alpha mask/etc.) - hard skip
-    if SPECIAL_SUFFIX_RE.search(nl):
-        return 'special'
-    if any(nl.startswith(p) for p in SPECIAL_PREFIXES):
-        return 'special'
-    if any(c in nl for c in SPECIAL_CONTAINS):
-        return 'special'
+    for p in SPECIAL_PREFIXES:
+        if nl.startswith(p):
+            return 'special', f'prefix:{p}'
+    for c in SPECIAL_CONTAINS:
+        if c in nl:
+            return 'special', f'contains:{c}'
 
     # 3b) Skydome / atmosphere - hard skip (AI hallucinates into gradients)
     if not any(g in nl for g in SKY_NOT):
-        if any(nl.startswith(p) for p in SKY_PREFIXES):
-            return 'sky'
-        if any(c in nl for c in SKY_CONTAINS):
-            return 'sky'
+        for p in SKY_PREFIXES:
+            if nl.startswith(p):
+                return 'sky', f'prefix:{p}'
+        for c in SKY_CONTAINS:
+            if c in nl:
+                return 'sky', f'contains:{c}'
 
     # 4) Organic - DAT2
-    if any(nl.startswith(p) for p in ORGANIC_PREFIXES):
-        return 'organic'
-    if any(c in nl for c in ORGANIC_CONTAINS):
-        return 'organic'
+    for p in ORGANIC_PREFIXES:
+        if nl.startswith(p):
+            return 'organic', f'prefix:{p}'
+    for c in ORGANIC_CONTAINS:
+        if c in nl:
+            return 'organic', f'contains:{c}'
 
     # 5) Architectural - LANCZOS
-    if any(nl.startswith(p) for p in ARCHITECTURAL_PREFIXES):
-        return 'arch'
-    if any(c in nl for c in ARCHITECTURAL_CONTAINS):
-        return 'arch'
+    for p in ARCHITECTURAL_PREFIXES:
+        if nl.startswith(p):
+            return 'arch', f'prefix:{p}'
+    for c in ARCHITECTURAL_CONTAINS:
+        if c in nl:
+            return 'arch', f'contains:{c}'
 
     # 6) Default: hard surface (ships, droids, characters, props) - DAT2
-    return 'hardsurface'
+    return 'hardsurface', 'default'
+
+
+def categorize(name: str, src_path: Path) -> str:
+    return categorize_with_reason(name, src_path)[0]
 
 
 def main() -> int:

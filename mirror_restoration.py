@@ -22,11 +22,14 @@ Reuses the proven building blocks rather than duplicating them:
   categorize.categorize                           (bucketing)
   build_tre.TreWriter / DiskFileEntry             (TRE 0005 writer)
 
-Staging layout (cached from prior runs, reused here):
-  staging/dds_in/texture/*.dds   source DDS (for format detection)
-  staging/png_in/*.png           source decoded PNG (texconv -ft png -m 1)
-  staging/render/<variant>/png_out/*.png   upscaled PNG (intermediate)
-  staging/render/<variant>/dds_out/texture/*.dds   final DDS for packing
+Staging layout (cached from prior runs, reused here) - resolved from --tre
+the same way hd_rerender.py resolves it (staging/<tre stem>/, or --staging
+to override), so running both tools against the same --tre always agrees on
+where things are. No manual copying between the two tools' staging dirs.
+  <staging>/dds_in/texture/*.dds   source DDS (for format detection)
+  <staging>/png_in/*.png           source decoded PNG (texconv -ft png -m 1)
+  <staging>/render/<variant>/png_out/*.png   upscaled PNG (intermediate)
+  <staging>/render/<variant>/dds_out/texture/*.dds   final DDS for packing
 """
 from __future__ import annotations
 
@@ -38,6 +41,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
@@ -47,16 +51,31 @@ sys.path.insert(0, str(THIS_DIR))
 
 from pil_upscale import read_dds_format, TEXCONV_FORMAT        # BGRA-aware
 from categorize import categorize                              # bucketing
-import hd_rerender as hr                                       # ComfyUI helpers + load_config
+import hd_rerender as hr                                       # ComfyUI helpers + load_config + resolve_staging
 
-TEXCONV   = THIS_DIR / 'bin' / 'texconv.exe'
-TOC_DIR   = THIS_DIR / 'restoration-toc'
-STAGING   = THIS_DIR / 'staging'
-DDS_IN    = STAGING / 'dds_in' / 'texture'
-PNG_IN    = STAGING / 'png_in'
-RENDER    = STAGING / 'render'
-TARGETS_JSON    = STAGING / 'restoration_targets.json'
-CATEGORIES_JSON = STAGING / 'restoration_categories.json'
+TEXCONV = THIS_DIR / 'bin' / 'texconv.exe'
+TOC_DIR = THIS_DIR / 'restoration-toc'
+
+
+@dataclass(frozen=True)
+class Paths:
+    staging: Path
+    dds_in: Path
+    png_in: Path
+    render: Path
+    targets_json: Path
+    categories_json: Path
+
+    @classmethod
+    def for_staging(cls, staging: Path) -> 'Paths':
+        return cls(
+            staging=staging,
+            dds_in=staging / 'dds_in' / 'texture',
+            png_in=staging / 'png_in',
+            render=staging / 'render',
+            targets_json=staging / 'restoration_targets.json',
+            categories_json=staging / 'restoration_categories.json',
+        )
 
 # Per-category routing plan. method: lanczos | comfy | copy.  scale: linear factor.
 # model only used for comfy. These are the plan-approved defaults; --model and
@@ -99,7 +118,7 @@ def load_index_paths(csv_path: Path, hd_only: bool = False) -> dict[str, int]:
     return out
 
 
-def cmd_manifest(args) -> int:
+def cmd_manifest(args, paths: Paths) -> int:
     hd  = load_index_paths(TOC_DIR / 'restoration_index.csv', hd_only=True)
     reb = load_index_paths(TOC_DIR / 'reborn_index.csv')
     ret = load_index_paths(TOC_DIR / 'retail_swgnge_index.csv')
@@ -107,8 +126,8 @@ def cmd_manifest(args) -> int:
 
     targets = sorted(p for p in hd if p in ours)
     missing = sorted(p for p in hd if p not in ours)
-    STAGING.mkdir(parents=True, exist_ok=True)
-    TARGETS_JSON.write_text(json.dumps(
+    paths.staging.mkdir(parents=True, exist_ok=True)
+    paths.targets_json.write_text(json.dumps(
         {'targets': targets, 'missing': missing,
          'restoration_hd_total': len(hd), 'sourced': len(targets)},
         indent=0), encoding='utf-8')
@@ -119,14 +138,15 @@ def cmd_manifest(args) -> int:
     no_png = []
     for p in targets:
         base = p.split('/')[-1]                       # texture/foo.dds -> foo.dds
-        src_dds = DDS_IN / base
+        src_dds = paths.dds_in / base
         cat = categorize(base, src_dds)
         cats[cat].append(base)
-        if not (PNG_IN / (Path(base).stem + '.png')).exists():
+        if not (paths.png_in / (Path(base).stem + '.png')).exists():
             no_png.append(base)
 
-    CATEGORIES_JSON.write_text(json.dumps(cats, indent=0), encoding='utf-8')
+    paths.categories_json.write_text(json.dumps(cats, indent=0), encoding='utf-8')
 
+    print(f'staging                   : {paths.staging}')
     print(f'Restoration HD .dds      : {len(hd)}')
     print(f'sourced (targets)        : {len(targets)}')
     print(f'unsourceable (skipped)   : {len(missing)}')
@@ -137,7 +157,7 @@ def cmd_manifest(args) -> int:
         print(f'  {k:12s} {len(cats[k]):6d}   -> {tag}')
     enh = sum(len(cats[k]) for k in ('arch', 'organic', 'hardsurface'))
     print(f'  {"ENHANCED":12s} {enh:6d}   (arch+organic+hardsurface)')
-    print(f'wrote {TARGETS_JSON.name} + {CATEGORIES_JSON.name}')
+    print(f'wrote {paths.targets_json.name} + {paths.categories_json.name}')
     return 0
 
 
@@ -168,7 +188,12 @@ def encode_png_to_dds(out_png: Path, src_dds: Path, dds_out_dir: Path, dds_name:
 
 
 def comfy_upscale_4x(src_png: Path, cfg: dict, model: str, work_subdir: str) -> Path | None:
-    """Run one image through ComfyUI's 4x model. Returns path to the 4x PNG."""
+    """Run one image through ComfyUI's 4x model via the batch API (a
+    single-item batch) - the shared workflow template
+    (workflows/upscale_4x_batch.json) only speaks the SWGLoadImageBatch /
+    SWGSaveImageBatch custom nodes (see comfyui_custom_nodes/swg_batch_io.py),
+    not the stock LoadImage/SaveImage nodes. Returns path to the 4x PNG.
+    """
     comfy_root = Path(cfg['comfy_root'])
     comfy_input = comfy_root / 'input' / 'swg'
     comfy_input.mkdir(parents=True, exist_ok=True)
@@ -181,25 +206,25 @@ def comfy_upscale_4x(src_png: Path, cfg: dict, model: str, work_subdir: str) -> 
 
     tpl = json.loads(hr.WORKFLOW_TPL.read_text(encoding='utf-8'))
     tpl.pop('_comment', None)
-    tpl['1']['inputs']['image'] = f'swg/{src_png.name}'
+    tpl['1']['inputs']['filenames'] = f'swg/{src_png.name}'
     tpl['2']['inputs']['model_name'] = model
-    tpl['4']['inputs']['filename_prefix'] = f'{work_subdir}/{src_png.stem}'
+    tpl['4']['inputs']['filenames'] = src_png.name
+    tpl['4']['inputs']['subfolder'] = work_subdir
 
     api = cfg['comfy_api']
     prompt_id = hr.submit_workflow(api, tpl, str(uuid.uuid4()))
-    entry = hr.wait_for_prompt(api, prompt_id, timeout=300.0)
-    imgs = entry.get('outputs', {}).get('4', {}).get('images', [])
-    if not imgs:
-        return None
-    img = imgs[0]
-    out = comfy_root / 'output' / img.get('subfolder', '') / img['filename']
+    hr.wait_for_prompt(api, prompt_id, timeout=300.0)
+    # SWGSaveImageBatch returns no UI/outputs metadata in the history entry
+    # (unlike stock SaveImage) - it writes the exact filename given, so check
+    # disk directly, same as hd_rerender.phase_upscale does for this node.
+    out = comfy_root / 'output' / work_subdir / src_png.name
     return out if out.exists() else None
 
 
-def render_one(base: str, plan: dict, cfg: dict | None, png_out_dir: Path,
-               dds_out_dir: Path, overwrite: bool) -> tuple[str, str | None]:
+def render_one(base: str, plan: dict, cfg: dict | None, dds_in: Path, png_in: Path,
+               png_out_dir: Path, dds_out_dir: Path, overwrite: bool) -> tuple[str, str | None]:
     """Render a single texture per its category plan. Returns (base, error|None)."""
-    src_dds = DDS_IN / base
+    src_dds = dds_in / base
     dds_target = dds_out_dir / base
     if dds_target.exists() and not overwrite:
         return (base, None)
@@ -216,7 +241,7 @@ def render_one(base: str, plan: dict, cfg: dict | None, png_out_dir: Path,
         except OSError as e:
             return (base, f'copy failed: {e}')
 
-    src_png = PNG_IN / (Path(base).stem + '.png')
+    src_png = png_in / (Path(base).stem + '.png')
     if not src_png.exists():
         return (base, 'no cached png')
     try:
@@ -257,8 +282,8 @@ def render_one(base: str, plan: dict, cfg: dict | None, png_out_dir: Path,
     return (base, None)
 
 
-def cmd_render(args) -> int:
-    cats = json.loads(CATEGORIES_JSON.read_text(encoding='utf-8'))
+def cmd_render(args, paths: Paths) -> int:
+    cats = json.loads(paths.categories_json.read_text(encoding='utf-8'))
 
     # Resolve which (base, plan) pairs to render.
     if args.names:
@@ -297,8 +322,8 @@ def cmd_render(args) -> int:
                              f'route needs it), or render only --category arch,special,cube,ui.')
 
     variant = args.variant
-    png_out_dir = RENDER / variant / 'png_out'
-    dds_out_dir = RENDER / variant / 'dds_out' / 'texture'
+    png_out_dir = paths.render / variant / 'png_out'
+    dds_out_dir = paths.render / variant / 'dds_out' / 'texture'
     png_out_dir.mkdir(parents=True, exist_ok=True)
     dds_out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -314,10 +339,12 @@ def cmd_render(args) -> int:
     ok = bad = 0
     t0 = time.time()
     fails: list[tuple[str, str]] = []
+    reasons: Counter = Counter()
 
     def work_one(item):
         b, c = item
-        return render_one(b, eff_plan(c), cfg, png_out_dir, dds_out_dir, args.overwrite)
+        return render_one(b, eff_plan(c), cfg, paths.dds_in, paths.png_in,
+                           png_out_dir, dds_out_dir, args.overwrite)
 
     # arch/copy are CPU/disk bound -> threads help; comfy is GPU-serialized but
     # ComfyUI queues internally, so a few outstanding submits keep it warm.
@@ -326,19 +353,30 @@ def cmd_render(args) -> int:
             if err:
                 bad += 1
                 fails.append((b, err))
+                reasons[err.split(':')[0].strip()] += 1
             else:
                 ok += 1
             done = ok + bad
             if done % 25 == 0 or done == len(work):
                 rate = done / max(0.001, time.time() - t0)
                 eta = (len(work) - done) / max(0.001, rate)
-                print(f'  {done}/{len(work)}  {rate:.2f}/s  eta {eta/60:.1f}min  ok={ok} bad={bad}')
+                top = ', '.join(f'{r}={n}' for r, n in reasons.most_common(3))
+                print(f'  {done}/{len(work)}  {rate:.2f}/s  eta {eta/60:.1f}min  ok={ok} bad={bad}'
+                      + (f'  [{top}]' if top else ''))
 
     print(f'[render] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
+    for reason, n in reasons.most_common():
+        print(f'   {reason:24s} {n}')
     for b, e in fails[:20]:
         print(f'   FAIL {b}: {e}', file=sys.stderr)
     if len(fails) > 20:
-        print(f'   ... +{len(fails)-20} more', file=sys.stderr)
+        print(f'   ... +{len(fails)-20} more (full list in render_report.json)', file=sys.stderr)
+
+    report = {'variant': variant, 'total': len(work), 'ok': ok, 'failed': bad,
+              'reasons': dict(reasons.most_common()), 'failed_files': sorted(fails)}
+    report_path = paths.render / variant / 'render_report.json'
+    report_path.write_text(json.dumps(report, indent=1), encoding='utf-8')
+    print(f'   report: {report_path}')
     return 0 if bad < max(5, len(work)//20) else 1
 
 
@@ -357,11 +395,17 @@ def _img_stats(arr):
 
 
 def _qc_one(dds_path: Path, cat: str, method_override: str | None, tmp_dir: Path,
-           fallback: bool) -> tuple[str, bool, str | None]:
+           fallback: bool, dds_in: Path, png_in: Path) -> tuple[str, bool, str | None]:
     """Worker-process body for one texture's QC check. Runs in a separate
     process so the texconv decode subprocess + numpy diff work actually
     spreads across cores. Each worker gets its own tmp subdir (keyed by pid)
     so concurrent decode_dds calls can't clash on the same output filename.
+
+    dds_in/png_in are passed explicitly rather than read from module globals
+    because ProcessPoolExecutor workers (spawned fresh, not forked, on
+    Windows) re-import this module from scratch and would otherwise only
+    ever see hardcoded defaults, not whatever --staging/--tre resolved to in
+    the parent process.
     """
     import numpy as np
     from quality_gate import decode_dds          # reuse the texconv decode
@@ -372,7 +416,7 @@ def _qc_one(dds_path: Path, cat: str, method_override: str | None, tmp_dir: Path
     if method == 'copy':                       # untouched originals always pass
         return base, True, None
 
-    src_png = PNG_IN / (Path(base).stem + '.png')
+    src_png = png_in / (Path(base).stem + '.png')
     worker_tmp = tmp_dir / f'w{os.getpid()}'
     worker_tmp.mkdir(parents=True, exist_ok=True)
     out_png = decode_dds(dds_path, worker_tmp)
@@ -412,19 +456,19 @@ def _qc_one(dds_path: Path, cat: str, method_override: str | None, tmp_dir: Path
         except OSError: pass
 
     if reason is not None and fallback:            # overwrite with the untouched original
-        src_dds = DDS_IN / base
+        src_dds = dds_in / base
         if src_dds.exists():
             dds_path.write_bytes(src_dds.read_bytes())
 
     return base, reason is None, reason
 
 
-def cmd_qc(args) -> int:
-    cats = json.loads(CATEGORIES_JSON.read_text(encoding='utf-8'))
+def cmd_qc(args, paths: Paths) -> int:
+    cats = json.loads(paths.categories_json.read_text(encoding='utf-8'))
     base2cat = {b: c for c, lst in cats.items() for b in lst}
 
-    dds_out_dir = RENDER / args.variant / 'dds_out' / 'texture'
-    tmp = RENDER / args.variant / 'qc_tmp'
+    dds_out_dir = paths.render / args.variant / 'dds_out' / 'texture'
+    tmp = paths.render / args.variant / 'qc_tmp'
     tmp.mkdir(parents=True, exist_ok=True)
     files = sorted(dds_out_dir.glob('*.dds'))
     if not files:
@@ -439,7 +483,7 @@ def cmd_qc(args) -> int:
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = [
             pool.submit(_qc_one, dds, base2cat.get(dds.name, 'hardsurface'),
-                        args.method, tmp, args.fallback)
+                        args.method, tmp, args.fallback, paths.dds_in, paths.png_in)
             for dds in files
         ]
         for fut in as_completed(futures):
@@ -458,7 +502,7 @@ def cmd_qc(args) -> int:
               'failed': len(failed), 'reasons': dict(reasons.most_common()),
               'fallback_applied': bool(args.fallback),
               'failed_files': sorted(failed)}
-    rep_path = RENDER / args.variant / 'qc_report.json'
+    rep_path = paths.render / args.variant / 'qc_report.json'
     rep_path.write_text(json.dumps(report, indent=1), encoding='utf-8')
     print(f'[qc] {passed}/{len(files)} pass, {len(failed)} fail'
           + (' (fell back to originals)' if args.fallback else ' (report only)'))
@@ -471,9 +515,9 @@ def cmd_qc(args) -> int:
 # ---------------------------------------------------------------------------
 # pack: build TRE shards from a render variant
 
-def cmd_pack(args) -> int:
+def cmd_pack(args, paths: Paths) -> int:
     from build_tre import TreWriter, DiskFileEntry
-    in_dir = RENDER / args.variant / 'dds_out'
+    in_dir = paths.render / args.variant / 'dds_out'
     files = sorted(in_dir.rglob('*.dds'))
     if not files:
         raise SystemExit(f'[pack] no DDS under {in_dir}')
@@ -502,11 +546,24 @@ def cmd_pack(args) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description='Mirror SWGRestoration HD selection, re-rendered locally.')
+
+    # Shared across every subcommand so staging always resolves the same way
+    # hd_rerender.py resolves it - pass the identical --tre you used for
+    # `hd_rerender.py extract`/`decode` and this lands on the same dir
+    # automatically. --staging still works to override it directly.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--tre', required=True,
+                        help='same --tre you passed to hd_rerender.py extract/decode; '
+                             'resolves to staging/<tre stem>/ so nothing needs to be '
+                             'copied between the two tools')
+    common.add_argument('--staging', default=None,
+                        help='override the staging dir instead of deriving it from --tre')
+
     sub = ap.add_subparsers(dest='cmd', required=True)
 
-    sub.add_parser('manifest', help='build scoped target list + category plan')
+    sub.add_parser('manifest', parents=[common], help='build scoped target list + category plan')
 
-    r = sub.add_parser('render', help='per-category re-render')
+    r = sub.add_parser('render', parents=[common], help='per-category re-render')
     r.add_argument('--config', default=str(THIS_DIR / 'hd_rerender.config.json'))
     r.add_argument('--category', help='comma list: arch,organic,hardsurface,special,cube,ui')
     r.add_argument('--names', help='JSON list of bare dds names to render (overrides --category)')
@@ -518,20 +575,22 @@ def main(argv=None) -> int:
     r.add_argument('--workers', type=int, default=4)
     r.add_argument('--overwrite', action='store_true')
 
-    q = sub.add_parser('qc', help='method-aware quality gate; --fallback reverts failures to original')
+    q = sub.add_parser('qc', parents=[common],
+                       help='method-aware quality gate; --fallback reverts failures to original')
     q.add_argument('--variant', default='main')
     q.add_argument('--method', choices=['lanczos', 'comfy', 'copy'], help='force a check mode (default: per-category)')
     q.add_argument('--fallback', action='store_true', help='overwrite failed outputs with the original DDS')
     q.add_argument('--workers', type=int, default=os.cpu_count() or 4,
                    help='parallel QC worker processes (default: cpu_count)')
 
-    p = sub.add_parser('pack', help='build TRE shard(s) from a render variant')
+    p = sub.add_parser('pack', parents=[common], help='build TRE shard(s) from a render variant')
     p.add_argument('--variant', default='main')
     p.add_argument('--out', default=r'E:\SWGNGE\reborn_restoration_hd.tre')
 
     args = ap.parse_args(argv)
+    paths = Paths.for_staging(hr.resolve_staging(args.tre, args.staging))
     return {'manifest': cmd_manifest, 'render': cmd_render,
-            'qc': cmd_qc, 'pack': cmd_pack}[args.cmd](args)
+            'qc': cmd_qc, 'pack': cmd_pack}[args.cmd](args, paths)
 
 
 if __name__ == '__main__':
