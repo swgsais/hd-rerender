@@ -126,10 +126,27 @@ def cmd_manifest(args, paths: Paths) -> int:
 
     targets = sorted(p for p in hd if p in ours)
     missing = sorted(p for p in hd if p not in ours)
+
+    # "in ours" only proves the name appears in a TOC scan (dump_toc_csv.py
+    # reads TRE headers only, which always succeeds). It says nothing about
+    # whether the actual payload made it onto disk - real extraction reads
+    # and decompresses the payload, which can fail per-file (corrupt data,
+    # size mismatch, etc.) without that ever showing up in a TOC scan. Cross-
+    # check against dds_in directly so "sourced" isn't a false promise -
+    # render_one already handles a name-only target gracefully ('no source
+    # dds'), but the count here should say so up front instead of claiming
+    # 100% coverage.
+    extracted: list[str] = []
+    not_extracted: list[str] = []
+    for p in targets:
+        base = p.split('/')[-1]
+        (extracted if (paths.dds_in / base).exists() else not_extracted).append(p)
+
     paths.staging.mkdir(parents=True, exist_ok=True)
     paths.targets_json.write_text(json.dumps(
-        {'targets': targets, 'missing': missing,
-         'restoration_hd_total': len(hd), 'sourced': len(targets)},
+        {'targets': targets, 'missing': missing, 'not_extracted': not_extracted,
+         'restoration_hd_total': len(hd), 'sourced': len(targets),
+         'actually_extracted': len(extracted)},
         indent=0), encoding='utf-8')
 
     # Categorize each target. categorize() wants the source DDS path for the
@@ -146,11 +163,13 @@ def cmd_manifest(args, paths: Paths) -> int:
 
     paths.categories_json.write_text(json.dumps(cats, indent=0), encoding='utf-8')
 
-    print(f'staging                   : {paths.staging}')
-    print(f'Restoration HD .dds      : {len(hd)}')
-    print(f'sourced (targets)        : {len(targets)}')
-    print(f'unsourceable (skipped)   : {len(missing)}')
-    print(f'targets without cached PNG: {len(no_png)}  (need extract+decode for full run)')
+    print(f'staging                     : {paths.staging}')
+    print(f'Restoration HD .dds         : {len(hd)}')
+    print(f'sourced (name match in TOC) : {len(targets)}')
+    print(f'  of which extracted to disk: {len(extracted)}')
+    print(f'  name-only (NOT on disk)   : {len(not_extracted)}  <- will fail render with "no source dds"')
+    print(f'unsourceable (no name match): {len(missing)}')
+    print(f'targets without cached PNG  : {len(no_png)}  (need extract+decode for full run)')
     print('--- category plan ---')
     for k, plan in CATEGORY_PLAN.items():
         tag = f"{plan['method']}@{plan['scale']}x" + (f" [{plan['model'].split('_')[-1]}]" if plan['model'] else '')
@@ -251,7 +270,14 @@ def render_one(base: str, plan: dict, cfg: dict | None, dds_in: Path, png_in: Pa
 
         if method == 'lanczos':
             with Image.open(src_png) as im:
-                up = im.resize((tw, th), Image.LANCZOS)
+                # Pillow's resize() raises for palette ('P') and other non-
+                # RGB(A) modes unless converted first - some customization/
+                # index-map textures decode to exactly that. RGBA is a safe
+                # universal target; encode_png_to_dds re-derives the real
+                # output format from the source DDS header regardless, so an
+                # RGBA intermediate PNG for a non-alpha target just has its
+                # alpha discarded by texconv, same as the comfy path below.
+                up = im.convert('RGBA').resize((tw, th), Image.LANCZOS)
         elif method == 'comfy':
             ai4x = comfy_upscale_4x(src_png, cfg, plan['model'], 'swg_mirror')
             if ai4x is None:
