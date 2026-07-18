@@ -84,6 +84,8 @@ SPECIAL_PREFIXES = (
     'grad_',     # gradient LUT strips (sky color ramps, etc.) - the engine
                  # samples these as lookup data; upscaling shifts the ramp
     'skybox_',   # skybox faces authored without the cube-map header flag
+    'hum_',      # human character textures - manually excluded after the
+                 # hum_f_freckles_s01.dds green-face corruption
 )
 SPECIAL_CONTAINS = (
     '_pattern',  # character face/body customization index patterns - the
