@@ -168,7 +168,12 @@ def encode_png_to_dds(out_png: Path, src_dds: Path, dds_out_dir: Path, dds_name:
 
 
 def comfy_upscale_4x(src_png: Path, cfg: dict, model: str, work_subdir: str) -> Path | None:
-    """Run one image through ComfyUI's 4x model. Returns path to the 4x PNG."""
+    """Run one image through ComfyUI's 4x model via the batch API (a
+    single-item batch) - the shared workflow template
+    (workflows/upscale_4x_batch.json) only speaks the SWGLoadImageBatch /
+    SWGSaveImageBatch custom nodes (see comfyui_custom_nodes/swg_batch_io.py),
+    not the stock LoadImage/SaveImage nodes. Returns path to the 4x PNG.
+    """
     comfy_root = Path(cfg['comfy_root'])
     comfy_input = comfy_root / 'input' / 'swg'
     comfy_input.mkdir(parents=True, exist_ok=True)
@@ -181,18 +186,18 @@ def comfy_upscale_4x(src_png: Path, cfg: dict, model: str, work_subdir: str) -> 
 
     tpl = json.loads(hr.WORKFLOW_TPL.read_text(encoding='utf-8'))
     tpl.pop('_comment', None)
-    tpl['1']['inputs']['image'] = f'swg/{src_png.name}'
+    tpl['1']['inputs']['filenames'] = f'swg/{src_png.name}'
     tpl['2']['inputs']['model_name'] = model
-    tpl['4']['inputs']['filename_prefix'] = f'{work_subdir}/{src_png.stem}'
+    tpl['4']['inputs']['filenames'] = src_png.name
+    tpl['4']['inputs']['subfolder'] = work_subdir
 
     api = cfg['comfy_api']
     prompt_id = hr.submit_workflow(api, tpl, str(uuid.uuid4()))
-    entry = hr.wait_for_prompt(api, prompt_id, timeout=300.0)
-    imgs = entry.get('outputs', {}).get('4', {}).get('images', [])
-    if not imgs:
-        return None
-    img = imgs[0]
-    out = comfy_root / 'output' / img.get('subfolder', '') / img['filename']
+    hr.wait_for_prompt(api, prompt_id, timeout=300.0)
+    # SWGSaveImageBatch returns no UI/outputs metadata in the history entry
+    # (unlike stock SaveImage) - it writes the exact filename given, so check
+    # disk directly, same as hd_rerender.phase_upscale does for this node.
+    out = comfy_root / 'output' / work_subdir / src_png.name
     return out if out.exists() else None
 
 
