@@ -1271,8 +1271,10 @@ def main(argv=None) -> int:
                          'dominate render time and archive size; they ship as originals.')
     ap.add_argument('--batch-pixel-budget', type=int, default=DEFAULT_BATCH_PIXEL_BUDGET,
                     help='upscale phase: max width*height*count per ComfyUI batch '
-                         f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 128 files at 256x256, '
-                         'scaled down for larger textures) - raise/lower to fit your VRAM')
+                         f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 512 files at 256x256, '
+                         'fewer for larger textures) - raise/lower to fit your VRAM. Applies '
+                         'to both the organic and hardsurface ComfyUI groups; arch never '
+                         'batches through ComfyUI at all, so this has no effect on it.')
     ap.add_argument('--timeout', type=float, default=900.0,
                     help='per-batch prompt timeout in seconds (default 900 = 15min; '
                          'batches now carry many files per prompt, not one, so this needs '
