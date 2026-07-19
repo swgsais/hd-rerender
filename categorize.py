@@ -94,6 +94,11 @@ SPECIAL_CONTAINS = (
     '_head',     # system at runtime; resampling shifts the index colors.
                  # Costs a few safe skips (weapon "_head" parts etc.) but
                  # face corruption is far worse than a non-HD vibroblade.
+    '_eye',      # eye customization set (hum_b_eye.dds/_m.dds/eyespec.dds -
+                 # missing-eyes corruption case). Catches the whole set
+                 # regardless of suffix convention (the bare _m and the
+                 # underscore-less eyespec companions don't match
+                 # SPECIAL_SUFFIX_RE, so this needs to stand on its own).
 )
 
 # Skydome imagery: not palette data, but the arch bucket's Lanczos-only
