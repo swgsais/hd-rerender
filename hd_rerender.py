@@ -6,7 +6,7 @@ Five-phase pipeline, each is a subcommand and resumable independently:
 
     extract  <source>.tre         ->  staging/dds_in/texture/*.dds  + manifest.json
     decode   staging/dds_in       ->  staging/png_in/*.png         (texconv -ft png)
-    upscale  staging/png_in       ->  staging/png_out/*.png        (per-category, see below)
+    upscale  staging/png_in       ->  staging/png_out/*.png        (ComfyUI /prompt API)
     encode   staging/png_out      ->  staging/dds_out/*.dds        (texconv, original BC fmt, mip regen)
     repack   staging/dds_out      ->  <source>_hd.tre              (build_tre.py)
 
@@ -19,15 +19,14 @@ output defaults to <source stem>_hd.tre next to the source.
 `all` runs the lot. Every phase skips files whose output already exists, so
 killing the run mid-way and restarting picks up where it left off.
 
-Upscale routing is per-category (CATEGORY_PLAN, validated against
-SWGRestoration's shipped output): arch renders via direct PIL Lanczos (no
-AI - avoids hallucinated vegetation on stone) to 3x; organic renders via
-ComfyUI's DAT2 model to 3x; hardsurface renders via ComfyUI's DevianceMIP
-model to 2x. cube/special/ui/sky are never upscaled at all (see
-EXCLUDED_CATEGORIES) - the engine reads those as structured data, not
+Every non-excluded texture (see EXCLUDED_CATEGORIES: cube/special/ui/sky
+are never upscaled at all - the engine reads those as structured data, not
 imagery, and upscaled versions corrupt load screens, character face
-tinting, and sky gradients in-game. --ship-scale overrides every category
-to one uniform scale for quick experiments.
+tinting, and sky gradients in-game) goes through the same ComfyUI model,
+chosen by --quality (QUALITY_MODELS: low/med/high, default med). --ship-
+scale controls the shipped size relative to the source (default
+DEFAULT_SHIP_SCALE = 4, i.e. ship the model's full native render with no
+downscale).
 
 The DDS format is round-tripped: for every input texture/foo.dds we record
 its width, height, BC format tag, and mipmap-count in manifest.json during
@@ -38,11 +37,9 @@ Configuration: edit hd_rerender.config.json next to this script, or pass
 flags. Required keys:
   comfy_root      - absolute path to ComfyUI install
   comfy_api       - base URL of ComfyUI API, default http://127.0.0.1:8188
-Optional keys (default to the validated models baked into this file if
-omitted - see CATEGORY_PLAN/DAT2/DEVIANCE):
-  organic_model     - filename in ComfyUI/models/upscale_models/
-  hardsurface_model - filename in ComfyUI/models/upscale_models/
-  upscale_model     - legacy alias for hardsurface_model (pre-routing configs)
+Optional keys:
+  model           - overrides --quality's model choice entirely
+  upscale_model   - legacy alias for model (pre-quality-tier configs)
 """
 from __future__ import annotations
 
@@ -99,31 +96,33 @@ TEXCONV_FORMAT = {
 SELF_THREADED_TEXCONV_FORMATS = {'BC7_UNORM'}
 
 # ---------------------------------------------------------------------------
-# Per-category upscale routing, validated against SWGRestoration's shipped
-# output in mirror_restoration.py's A/B pilot (see that file's CATEGORY_PLAN
-# for the original comparison - this is an independent copy, not shared code,
-# so the two tools can't drift into breaking each other).
+# Upscale model / quality tiers.
 #
-#   arch        - architectural/hard-surface environment art. AI upscalers
-#                 hallucinate vegetation onto stone, so this bypasses ComfyUI
-#                 entirely and goes straight PIL Lanczos to the target scale.
-#   organic     - foliage/plants. DAT2 aligned well with this content in the
-#                 pilot.
-#   hardsurface - ships/droids/weapons/props/characters. DevianceMIP matched
-#                 the reference's smooth-bright look; DAT2 amplified dither
-#                 into dot-grid artifacts on this bucket specifically.
+# Earlier revisions of this file routed arch/organic/hardsurface through
+# different methods and models (arch via plain Lanczos - AI upscalers were
+# thought to hallucinate vegetation onto stone; organic/hardsurface via
+# separate ComfyUI models chosen in an A/B pilot against SWGRestoration's
+# shipped output). Direct testing superseded that: a single model (SPAN)
+# turned out faster than the pilot's picks AND showed no hallucination
+# issue on architecture either, so every category now gets identical
+# treatment - one ComfyUI pass, one model, one shipped scale.
 #
-# cube/special/ui/sky need no entry here - EXCLUDED_CATEGORIES (below) filters
-# them out upstream of all routing, in every phase that calls
-# load_excluded_names().
+# --quality selects the model. All three tiers currently point at SPAN -
+# there's no validated reason yet to run a slower model for any tier. Once
+# one is validated for a specific tier, swap the relevant line, e.g.:
+#   'low':  SOME_FASTER_MODEL,
+#   'high': DAT2,   # or DEVIANCE, or a different model entirely
+SPAN     = '4x-PBRify_UpscalerSPANV4.pth'
 DAT2     = '4x-PBRify_UpscalerDAT2_V1.pth'
 DEVIANCE = '4x_BS_DevianceMIP.pth'
 
-CATEGORY_PLAN = {
-    'arch':        {'method': 'lanczos', 'scale': 3},
-    'organic':     {'method': 'comfy',   'scale': 3, 'model_key': 'organic_model'},
-    'hardsurface': {'method': 'comfy',   'scale': 2, 'model_key': 'hardsurface_model'},
+QUALITY_MODELS = {
+    'low':  SPAN,
+    'med':  SPAN,
+    'high': SPAN,
 }
+DEFAULT_QUALITY = 'med'
+DEFAULT_SHIP_SCALE = 4   # "medium" ships at the model's full native render, no downscale
 
 
 def read_dds_meta(path: Path) -> dict:
@@ -216,15 +215,20 @@ def load_config(path: Path) -> dict:
         if key not in cfg:
             raise SystemExit(f'config missing key: {key}')
     cfg['comfy_root'] = str(Path(cfg['comfy_root']).resolve())
-    # organic/hardsurface each need their own model (see CATEGORY_PLAN) -
-    # config can override either; omitted keys fall back to the validated
-    # defaults. upscale_model is a legacy alias from before per-category
-    # routing existed - it only ever fed a single global model, so it maps
-    # onto hardsurface_model (the closer analog: hardsurface was always the
-    # largest bucket) and never organic_model.
-    cfg['organic_model'] = cfg.get('organic_model', DAT2)
-    cfg['hardsurface_model'] = cfg.get('hardsurface_model', cfg.get('upscale_model', DEVIANCE))
     return cfg
+
+
+def resolve_model(args, cfg: dict) -> str:
+    """--model (CLI) > config's model/upscale_model > --quality tier default.
+    upscale_model is a legacy config key from before quality tiers existed;
+    still honored so an old config keeps working unchanged."""
+    if args.model:
+        return args.model
+    if cfg.get('model'):
+        return cfg['model']
+    if cfg.get('upscale_model'):
+        return cfg['upscale_model']
+    return QUALITY_MODELS[args.quality]
 
 
 def load_manifest(path: Path) -> dict:
@@ -262,33 +266,11 @@ def load_excluded_names(staging: Path) -> set[str]:
     return {n for k in EXCLUDED_CATEGORIES for n in cats.get(k, [])}
 
 
-def category_lookup(staging: Path) -> dict[str, str]:
-    """dds basename -> category, for the categories phase_upscale/
-    phase_encode actually route (arch/organic/hardsurface). categorize.py's
-    routing is exhaustive (always falls through to 'hardsurface'), so a
-    missing name here only means it was added to png_in after extract wrote
-    categories.json - callers should .get(name, 'hardsurface') defensively
-    rather than treat that as impossible."""
-    cats = load_categories(staging)
-    return {n: k for k, names in cats.items() for n in names}
-
-
-def effective_scale(category: str, args) -> int:
-    """--ship-scale, if explicitly passed, overrides every category
-    uniformly (an escape hatch for quick experiments). Otherwise use the
-    category's own validated scale from CATEGORY_PLAN."""
-    if args.ship_scale is not None:
-        return args.ship_scale
-    return CATEGORY_PLAN.get(category, CATEGORY_PLAN['hardsurface'])['scale']
-
-
 def target_dims(meta: dict, scale: int, max_dim: int) -> tuple[int, int]:
     """Shipped size for a source of meta['width']/['height']: scale up,
-    capped at max_dim per side. Shared by phase_upscale's arch-lanczos
-    renderer and phase_encode's pending-list builder so both compute the
-    identical target - that's what makes prepare_ship_png's existing
-    already-correct-size no-op safe for arch without touching that
-    function."""
+    capped at max_dim per side. All categories now use the same scale
+    (--ship-scale, default DEFAULT_SHIP_SCALE), so a single args.ship_scale
+    value feeds this everywhere it's called."""
     return (min(meta['width'] * scale, max_dim), min(meta['height'] * scale, max_dim))
 
 
@@ -631,57 +613,45 @@ def retry_shrinking(batch: list[Path], attempt) -> list[tuple[str, str | None]]:
             + retry_shrinking(failed_batch[mid:], attempt))
 
 
-def phase_upscale_lanczos(todo: list[Path], staging: Path, out_dir: Path, args) -> tuple[int, int]:
-    """Direct Lanczos upscale for 'arch' textures - no ComfyUI involved at
-    all. AI upscalers hallucinate vegetation onto stone, so this bucket
-    renders straight from the original PNG to its target scale instead of
-    going through a model. Returns (ok, bad)."""
-    from PIL import Image
-    Image.MAX_IMAGE_PIXELS = None      # our own renders, not untrusted uploads
-    manifest = load_manifest(staging / 'manifest.json')['entries']
-    scale = effective_scale('arch', args)
-
-    def render_one(png: Path) -> tuple[str, str | None]:
-        meta = manifest.get(png.stem + '.dds')
-        if meta is None:
-            return (png.name, 'no manifest entry')
-        tw, th = target_dims(meta, scale, args.max_dim)
-        try:
-            with Image.open(png) as im:
-                # convert() first: Pillow raises on resize() for some non-
-                # RGB(A) modes (e.g. palette) otherwise, and a handful of
-                # customization/index-map textures decode to exactly that.
-                up = im.convert('RGBA').resize((tw, th), Image.LANCZOS)
-            up.save(out_dir / png.name)
-            return (png.name, None)
-        except Exception as e:
-            return (png.name, repr(e))
-
-    print(f'[upscale:arch] {len(todo)} PNG -> Lanczos {scale}x (workers={args.workers}, no ComfyUI needed)')
-    ok = bad = 0
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        for name, err in pool.map(render_one, todo):
-            if err:
-                bad += 1
-                print(f'  FAIL {name}: {err}', file=sys.stderr, flush=True)
-            else:
-                ok += 1
-            done = ok + bad
-            if done % 250 == 0 or done == len(todo):
-                rate = done / max(0.001, time.time() - t0)
-                print(f'  arch ~{done}/{len(todo)}  ({rate:.1f} files/s)')
-    print(f'[upscale:arch] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
-    return ok, bad
-
-
 def phase_upscale(args, cfg: dict) -> int:
     in_dir  = Path(args.staging) / 'png_in'
     out_dir = Path(args.staging) / 'png_out'
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    comfy_input      = Path(cfg['comfy_root']) / 'input'  / 'swg'
+    comfy_output_root = Path(cfg['comfy_root']) / 'output'
+    batch_subfolder  = 'swg_hd_batch'
+    comfy_input.mkdir(parents=True, exist_ok=True)
+    (comfy_output_root / batch_subfolder).mkdir(parents=True, exist_ok=True)
+
+    tpl = json.loads(WORKFLOW_TPL.read_text(encoding='utf-8'))
+    tpl.pop('_comment', None)
+
+    api = cfg['comfy_api']
+    model = cfg['model']
+    client_id = str(uuid.uuid4())
+
+    # /system_stats is a cheap health check that also verifies the API is up.
+    try:
+        comfy_get_json(api, '/system_stats')
+    except Exception as e:
+        raise SystemExit(f'cannot reach ComfyUI at {api}: {e}')
+
+    # The batch workflow depends on our custom nodes; fail once with install
+    # instructions instead of letting every /prompt bounce on an unknown
+    # class_type.
+    try:
+        node_info = comfy_get_json(api, '/object_info/SWGLoadImageBatch')
+    except Exception:
+        node_info = {}
+    if 'SWGLoadImageBatch' not in node_info:
+        raise SystemExit(
+            'ComfyUI is running but the SWG batch nodes are not loaded.\n'
+            f'Copy {THIS_DIR / "comfyui_custom_nodes" / "swg_batch_io.py"} into\n'
+            f'{Path(cfg["comfy_root"]) / "custom_nodes"}\\ and restart ComfyUI.'
+        )
+
     excluded = load_excluded_names(Path(args.staging))
-    cat_of = category_lookup(Path(args.staging))
     todo = []
     skipped_excluded = 0
     for png in in_dir.glob('*.png'):
@@ -694,220 +664,141 @@ def phase_upscale(args, cfg: dict) -> int:
             continue
         todo.append(png)
 
-    print(f'[upscale] {len(todo)} PNG to route ({skipped_excluded} engine-data files skipped)')
+    print(f'[upscale] {len(todo)} PNG -> HD PNG via ComfyUI ({api}, model={model}, '
+          f'quality={args.quality}, {skipped_excluded} engine-data files skipped)')
     if not todo:
         return 0
 
-    # Partition by category - each gets a different method/scale/model (see
-    # CATEGORY_PLAN). categorize.py's routing is exhaustive so this only
-    # falls back to 'hardsurface' for a name genuinely missing from
-    # categories.json (e.g. added to png_in after extract ran).
-    arch_todo, organic_todo, hardsurface_todo = [], [], []
-    missing_cat = 0
-    for png in todo:
-        dds_name = png.stem + '.dds'
-        if dds_name not in cat_of:
-            missing_cat += 1
-        cat = cat_of.get(dds_name, 'hardsurface')
-        (arch_todo if cat == 'arch' else
-         organic_todo if cat == 'organic' else
-         hardsurface_todo).append(png)
-    if missing_cat:
-        print(f'  WARN {missing_cat} files missing from categories.json, defaulted to hardsurface '
-              f'(added to png_in after extract ran?)', file=sys.stderr)
+    dims = load_png_dims(Path(args.staging), todo)
+    missing_dims = [p for p in todo if p not in dims]
+    if missing_dims:
+        print(f'  WARN {len(missing_dims)} files have no manifest entry, skipping '
+              f'(e.g. {missing_dims[0].name})', file=sys.stderr)
 
-    grand_ok = grand_bad = 0
+    # Sources already at/above --max-source-dim gain almost nothing from AI
+    # upscaling but dominate render time and archive size (a 2048 source at
+    # 4x is a 128+ MB DDS). They ship as originals via client fallback.
+    too_big = [p for p in list(dims) if max(dims[p]) > args.max_source_dim]
+    for p in too_big:
+        del dims[p]
+    if too_big:
+        print(f'  {len(too_big)} sources > {args.max_source_dim}px skipped '
+              f'(already high-res; ship as originals)')
 
-    # arch needs no ComfyUI at all - render it first and unconditionally, so
-    # an arch-only run never even has to reach ComfyUI.
-    if arch_todo:
-        ok, bad = phase_upscale_lanczos(arch_todo, Path(args.staging), out_dir, args)
-        grand_ok += ok
-        grand_bad += bad
+    batches = build_upscale_batches(dims, args.batch_pixel_budget)
+    sizes_seen = sorted({dims[b[0]] for b in batches})
+    print(f'  {len(batches)} batches across {len(sizes_seen)} distinct sizes '
+          f'(pixel budget={args.batch_pixel_budget:,})')
 
-    comfy_groups = [(cat, group, model) for cat, group, model in
-                     (('organic', organic_todo, cfg['organic_model']),
-                      ('hardsurface', hardsurface_todo, cfg['hardsurface_model']))
-                     if group]
+    def attempt(batch: list[Path]) -> list[tuple[str, str | None]]:
+        """Submit one same-size batch and check its outputs. Called directly
+        by process_batch below, and again (on smaller sub-batches) by
+        retry_shrinking if this batch fails - most likely a VRAM OOM at
+        this size, since the upscale workflow is all-or-nothing per graph
+        execution.
+        """
+        names = [p.name for p in batch]
 
-    if comfy_groups:
-        comfy_input      = Path(cfg['comfy_root']) / 'input'  / 'swg'
-        comfy_output_root = Path(cfg['comfy_root']) / 'output'
-        batch_subfolder  = 'swg_hd_batch'
-        comfy_input.mkdir(parents=True, exist_ok=True)
+        # Stage inputs into ComfyUI/input/swg/ (same drive = hard link / copy).
+        # comfy_input lives inside the ComfyUI install, not our own staging/
+        # or output/ dirs, so it survives across unrelated runs (different
+        # archive, older version of this one). A same-named leftover there
+        # from a prior run would otherwise never get refreshed, so we can't
+        # just trust staged.exists() like before. But re-staging is cheap
+        # only when os.link succeeds (same-drive hardlink, an O(1) metadata
+        # op) - on a cross-drive ComfyUI install it falls back to a full
+        # read+write copy, and unconditionally redoing that for every batch
+        # attempt (including retries and resumed runs where the file was
+        # already staged correctly) adds real I/O for nothing. A size check
+        # is a single cheap stat() and still catches the actual failure mode
+        # (a differently-sized leftover) without repeating the expensive path
+        # when nothing has changed.
+        for p in batch:
+            staged = comfy_input / p.name
+            if staged.exists():
+                if staged.stat().st_size == p.stat().st_size:
+                    continue
+                staged.unlink()
+            try:
+                os.link(p, staged)
+            except OSError:
+                staged.write_bytes(p.read_bytes())
 
-        tpl = json.loads(WORKFLOW_TPL.read_text(encoding='utf-8'))
-        tpl.pop('_comment', None)
+        wf = json.loads(json.dumps(tpl))  # deep copy
+        wf['1']['inputs']['filenames'] = '\n'.join(f'swg/{n}' for n in names)
+        wf['2']['inputs']['model_name'] = model
+        wf['4']['inputs']['filenames'] = '\n'.join(names)
+        wf['4']['inputs']['subfolder'] = batch_subfolder
 
-        api = cfg['comfy_api']
-        client_id = str(uuid.uuid4())
-
-        # /system_stats is a cheap health check that also verifies the API is up.
         try:
-            comfy_get_json(api, '/system_stats')
+            prompt_id = submit_workflow(api, wf, client_id)
+            wait_for_prompt(api, prompt_id, timeout=args.timeout)
+        except TimeoutError as e:
+            # Giving up on the poll doesn't cancel the job server-side -
+            # interrupt it so it isn't still running/queued when we (or a
+            # split retry) submit the next thing.
+            comfy_interrupt(api)
+            return [(n, f'TIMEOUT: {e}') for n in names]
         except Exception as e:
-            raise SystemExit(f'cannot reach ComfyUI at {api}: {e}')
+            return [(n, f'batch submit/poll failed: {e}') for n in names]
 
-        # The batch workflow depends on our custom nodes; fail once with install
-        # instructions instead of letting every /prompt bounce on an unknown
-        # class_type.
-        try:
-            node_info = comfy_get_json(api, '/object_info/SWGLoadImageBatch')
-        except Exception:
-            node_info = {}
-        if 'SWGLoadImageBatch' not in node_info:
-            raise SystemExit(
-                'ComfyUI is running but the SWG batch nodes are not loaded.\n'
-                f'Copy {THIS_DIR / "comfyui_custom_nodes" / "swg_batch_io.py"} into\n'
-                f'{Path(cfg["comfy_root"]) / "custom_nodes"}\\ and restart ComfyUI.'
-            )
+        # We control the exact output filenames ourselves (SWGSaveImageBatch
+        # writes each slot under its real name), so there's no SaveImage
+        # prefix+counter metadata to parse - just check disk directly, same
+        # "truth is on disk" approach as decode/encode.
+        results = []
+        for n in names:
+            src = comfy_output_root / batch_subfolder / n
+            results.append((n, None) if src.exists() else (n, f'batch output missing: {src}'))
+        return results
 
-        def make_attempt(model_name: str, out_subfolder: str):
-            (comfy_output_root / out_subfolder).mkdir(parents=True, exist_ok=True)
+    def process_batch(batch: list[Path]) -> list[tuple[str, str | None]]:
+        return retry_shrinking(batch, attempt)
 
-            def attempt(batch: list[Path]) -> list[tuple[str, str | None]]:
-                """Submit one same-size batch and check its outputs. Called directly
-                by process_batch below, and again (on smaller sub-batches) by
-                retry_shrinking if this batch fails - most likely a VRAM OOM at
-                this size, since the upscale workflow is all-or-nothing per graph
-                execution.
-                """
-                names = [p.name for p in batch]
-
-                # Stage inputs into ComfyUI/input/swg/ (same drive = hard link /
-                # copy). comfy_input lives inside the ComfyUI install, not our own
-                # staging/ or output/ dirs, so it survives across unrelated runs
-                # (different archive, older version of this one). A same-named
-                # leftover there from a prior run would otherwise never get
-                # refreshed, so we can't just trust staged.exists() like before.
-                # But re-staging is cheap only when os.link succeeds (same-drive
-                # hardlink, an O(1) metadata op) - on a cross-drive ComfyUI
-                # install it falls back to a full read+write copy, and
-                # unconditionally redoing that for every batch attempt (including
-                # retries and resumed runs where the file was already staged
-                # correctly) adds real I/O for nothing. A size check is a single
-                # cheap stat() and still catches the actual failure mode (a
-                # differently-sized leftover) without repeating the expensive
-                # path when nothing has changed.
-                for p in batch:
-                    staged = comfy_input / p.name
-                    if staged.exists():
-                        if staged.stat().st_size == p.stat().st_size:
-                            continue
-                        staged.unlink()
+    # ONE batch in flight at a time. comfy_interrupt (fired on timeout)
+    # cancels whatever ComfyUI is currently executing — with concurrent
+    # submissions that is most likely some OTHER submission's healthy batch,
+    # so a single timeout would cascade into killing good work. Batches are
+    # already sized to saturate the GPU on their own; --workers still drives
+    # the CPU-bound phases.
+    total = sum(len(b) for b in batches)
+    ok = bad = 0
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        futures = [pool.submit(process_batch, b) for b in batches]
+        for fut in as_completed(futures):
+            batch_ok = batch_bad = 0
+            for name, err in fut.result():
+                if err:
+                    bad += 1
+                    batch_bad += 1
+                    print(f'  FAIL {name}: {err}', file=sys.stderr, flush=True)
+                    continue
+                src = comfy_output_root / batch_subfolder / name
+                dst = out_dir / name
+                if dst.exists() and args.overwrite:
+                    dst.unlink()
+                if not dst.exists():
                     try:
-                        os.link(p, staged)
-                    except OSError:
-                        staged.write_bytes(p.read_bytes())
+                        os.link(src, dst)
+                    except OSError:                # cross-drive, perms, etc.
+                        dst.write_bytes(src.read_bytes())
+                ok += 1
+                batch_ok += 1
+            # One line per completed batch, regardless of --batch-pixel-budget
+            # (a large batch might otherwise go minutes with no output; a
+            # small one would spam under the old every-250-files gate).
+            done = ok + bad
+            rate = done / max(0.001, time.time() - t0)
+            eta  = (total - done) / max(0.001, rate)
+            print(f'  batch done: {batch_ok} ok, {batch_bad} failed  |  '
+                  f'overall {done}/{total}  rate={rate:.2f}/s  eta={eta/60:.1f}min',
+                  flush=True)
 
-                wf = json.loads(json.dumps(tpl))  # deep copy
-                wf['1']['inputs']['filenames'] = '\n'.join(f'swg/{n}' for n in names)
-                wf['2']['inputs']['model_name'] = model_name
-                wf['4']['inputs']['filenames'] = '\n'.join(names)
-                wf['4']['inputs']['subfolder'] = out_subfolder
-
-                try:
-                    prompt_id = submit_workflow(api, wf, client_id)
-                    wait_for_prompt(api, prompt_id, timeout=args.timeout)
-                except TimeoutError as e:
-                    # Giving up on the poll doesn't cancel the job server-side -
-                    # interrupt it so it isn't still running/queued when we (or a
-                    # split retry) submit the next thing.
-                    comfy_interrupt(api)
-                    return [(n, f'TIMEOUT: {e}') for n in names]
-                except Exception as e:
-                    return [(n, f'batch submit/poll failed: {e}') for n in names]
-
-                # We control the exact output filenames ourselves (SWGSaveImageBatch
-                # writes each slot under its real name), so there's no SaveImage
-                # prefix+counter metadata to parse - just check disk directly, same
-                # "truth is on disk" approach as decode/encode.
-                results = []
-                for n in names:
-                    src = comfy_output_root / out_subfolder / n
-                    results.append((n, None) if src.exists() else (n, f'batch output missing: {src}'))
-                return results
-            return attempt
-
-        for category, group_todo, model in comfy_groups:
-            dims = load_png_dims(Path(args.staging), group_todo)
-            missing_dims = [p for p in group_todo if p not in dims]
-            if missing_dims:
-                print(f'  WARN [{category}] {len(missing_dims)} files have no manifest entry, '
-                      f'skipping (e.g. {missing_dims[0].name})', file=sys.stderr)
-
-            # Sources already at/above --max-source-dim gain almost nothing from
-            # AI upscaling but dominate render time and archive size (a 2048
-            # source at 4x is a 128+ MB DDS). They ship as originals via client
-            # fallback.
-            too_big = [p for p in list(dims) if max(dims[p]) > args.max_source_dim]
-            for p in too_big:
-                del dims[p]
-            if too_big:
-                print(f'  [{category}] {len(too_big)} sources > {args.max_source_dim}px skipped '
-                      f'(already high-res; ship as originals)')
-            if not dims:
-                continue
-
-            batches = build_upscale_batches(dims, args.batch_pixel_budget)
-            sizes_seen = sorted({dims[b[0]] for b in batches})
-            print(f'[upscale:{category}] {len(dims)} PNG -> HD PNG via ComfyUI ({api}, model={model})')
-            print(f'  {len(batches)} batches across {len(sizes_seen)} distinct sizes '
-                  f'(pixel budget={args.batch_pixel_budget:,})')
-
-            attempt = make_attempt(model, f'{batch_subfolder}/{category}')
-
-            def process_batch(batch: list[Path]) -> list[tuple[str, str | None]]:
-                return retry_shrinking(batch, attempt)
-
-            # ONE batch in flight at a time. comfy_interrupt (fired on timeout)
-            # cancels whatever ComfyUI is currently executing — with concurrent
-            # submissions that is most likely some OTHER submission's healthy
-            # batch, so a single timeout would cascade into killing good work.
-            # Batches are already sized to saturate the GPU on their own;
-            # --workers still drives the CPU-bound phases.
-            total = sum(len(b) for b in batches)
-            ok = bad = 0
-            t0 = time.time()
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                futures = [pool.submit(process_batch, b) for b in batches]
-                for fut in as_completed(futures):
-                    batch_ok = batch_bad = 0
-                    for name, err in fut.result():
-                        if err:
-                            bad += 1
-                            batch_bad += 1
-                            print(f'  FAIL {name}: {err}', file=sys.stderr, flush=True)
-                            continue
-                        src = comfy_output_root / f'{batch_subfolder}/{category}' / name
-                        dst = out_dir / name
-                        if dst.exists() and args.overwrite:
-                            dst.unlink()
-                        if not dst.exists():
-                            try:
-                                os.link(src, dst)
-                            except OSError:                # cross-drive, perms, etc.
-                                dst.write_bytes(src.read_bytes())
-                        ok += 1
-                        batch_ok += 1
-                    # One line per completed batch, regardless of --batch-pixel-budget
-                    # (a large batch might otherwise go minutes with no output; a
-                    # small one would spam under the old every-250-files gate).
-                    done = ok + bad
-                    rate = done / max(0.001, time.time() - t0)
-                    eta  = (total - done) / max(0.001, rate)
-                    print(f'  [{category}] batch done: {batch_ok} ok, {batch_bad} failed  |  '
-                          f'overall {done}/{total}  rate={rate:.2f}/s  eta={eta/60:.1f}min',
-                          flush=True)
-
-            print(f'[upscale:{category}] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
-            grand_ok += ok
-            grand_bad += bad
-
-    print(f'[upscale] done: {grand_ok} ok, {grand_bad} failed')
+    print(f'[upscale] done: {ok} ok, {bad} failed, {time.time()-t0:.0f}s')
     # Tolerate a few per-file failures (huge textures, transient model OOM)
     # rather than aborting the whole `all` pipeline; >5% failed is the cliff.
-    return 0 if grand_bad < max(10, len(todo) // 20) else 1
+    return 0 if bad < max(10, len(todo) // 20) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -918,18 +809,16 @@ def prepare_ship_png(png_out: Path, png_in_dir: Path, ship_png: Path,
     """Turn a phase_upscale render into the PNG we actually encode and ship:
 
     - Lanczos-downscale to target_wh (see target_dims() - source dims *
-      the category's scale from CATEGORY_PLAN, or --ship-scale if given,
-      capped at --max-dim). For organic/hardsurface this downscales from
-      the ComfyUI model's native render size; render-native-then-ship-
-      smaller is the recipe the composite-armor pilot validated against
-      SWGRestoration. For arch, phase_upscale_lanczos already rendered
-      directly at target_wh, so this resize is a no-op (see its width/
-      height-already-match check below) - the same target_dims() call is
-      used on both sides specifically so the two never disagree.
+      --ship-scale, capped at --max-dim, same value for every category).
+      Downscales from the ComfyUI model's native render size (all models
+      here render at their native ~4x, regardless of --quality); render-
+      native-then-ship-smaller is the recipe the composite-armor pilot
+      validated against SWGRestoration. When --ship-scale is left at its
+      default (DEFAULT_SHIP_SCALE = 4, "medium"), target_wh equals the
+      native render size, so this resize is a no-op.
     - Re-attach the source alpha channel (ComfyUI's save path is RGB-only;
-      lost alpha turns alpha-cut foliage/glass/decals into opaque quads).
-      Not needed for arch, which never touches ComfyUI and keeps its alpha
-      throughout, but harmless to run the same code path regardless.
+      lost alpha turns alpha-cut foliage/glass/decals into opaque quads -
+      the "broken bush" bug).
 
     Runs in a worker process; exceptions are returned, not raised, so one
     corrupt file can't abort the whole encode phase.
@@ -986,11 +875,9 @@ def phase_encode(args, cfg: dict) -> int:
     # First pass: figure out which files actually need work (manifest lookup
     # + skip-existing), without doing any CPU work yet.
     excluded = load_excluded_names(Path(args.staging))
-    cat_of = category_lookup(Path(args.staging))
     pending: list[tuple[Path, str, str, tuple[int, int]]] = []   # (png, dds_name, tex_fmt, target_wh)
     skipped = 0
     skipped_excluded = 0
-    missing_cat = 0
     for png in in_dir.glob('*.png'):
         dds_name = png.stem + '.dds'
         if dds_name in excluded:                 # stale upscale from an older run
@@ -1008,18 +895,8 @@ def phase_encode(args, cfg: dict) -> int:
         if target.exists() and not args.overwrite:
             skipped += 1
             continue
-        if dds_name not in cat_of:
-            missing_cat += 1
-        category = cat_of.get(dds_name, 'hardsurface')
-        # Same target_dims() call phase_upscale_lanczos used for arch, so an
-        # arch render (already at its final size) hits prepare_ship_png's
-        # existing "skip resize if already correct size" path as a true
-        # no-op instead of being resized again.
-        target_wh = target_dims(meta, effective_scale(category, args), args.max_dim)
+        target_wh = target_dims(meta, args.ship_scale, args.max_dim)
         pending.append((png, dds_name, tex_fmt, target_wh))
-    if missing_cat:
-        print(f'  WARN {missing_cat} files missing from categories.json, defaulted to hardsurface '
-              f'scale (added to png_in after extract ran?)', file=sys.stderr)
 
     # Ship-prep (downscale to ship size + alpha re-attach) is pure per-file
     # CPU work with no shared state, so fan it out across processes.
@@ -1242,26 +1119,21 @@ def main(argv=None) -> int:
     ap.add_argument('--out-tre', default=None,
                     help='output archive path (default: <tre stem>_hd.tre next to the source)')
     ap.add_argument('--workers', type=int, default=4)
-    ap.add_argument('--ship-scale', type=int, default=None,
-                    help='override EVERY category to this shipped-size multiplier, '
-                         'uniformly (escape hatch for quick experiments). Default '
-                         '(omit this flag): the validated per-category scales — '
-                         'arch=3x (direct Lanczos, no ComfyUI), organic=3x, '
-                         'hardsurface=2x (both via ComfyUI at native render size, '
-                         'Lanczos-downscaled to the target). Shipping raw native-'
-                         'render size quadruples archive size for detail the engine '
-                         'never resolves. Changing this between runs requires '
-                         'upscale/encode --overwrite (or deleting png_out/dds_out) — '
-                         'already-rendered files at the old size/model otherwise pass '
-                         'the skip-existing check silently.')
-    ap.add_argument('--organic-model', default=None,
-                    help='override the ComfyUI model used for the organic category '
-                         '(default: config\'s organic_model, or the validated DAT2 '
-                         'default if unset)')
-    ap.add_argument('--hardsurface-model', default=None,
-                    help='override the ComfyUI model used for the hardsurface category '
-                         '(default: config\'s hardsurface_model/upscale_model, or the '
-                         'validated DevianceMIP default if unset)')
+    ap.add_argument('--quality', choices=sorted(QUALITY_MODELS), default=DEFAULT_QUALITY,
+                    help=f'which ComfyUI model to use, via QUALITY_MODELS (default '
+                         f'{DEFAULT_QUALITY!r}). All three tiers currently point at the '
+                         f'same model (SPAN) - see QUALITY_MODELS in this file to point a '
+                         f'tier at a different one once validated.')
+    ap.add_argument('--model', default=None,
+                    help='override --quality entirely with a specific ComfyUI model '
+                         'filename, for one-off experiments')
+    ap.add_argument('--ship-scale', type=int, default=DEFAULT_SHIP_SCALE,
+                    help=f'shipped size = source dims x this (default {DEFAULT_SHIP_SCALE} '
+                         f'= ship the model\'s full native render, no downscale). Lower to '
+                         f'shrink archive size at the cost of some of the model\'s detail. '
+                         f'Changing this between runs requires upscale/encode --overwrite '
+                         f'(or deleting png_out/dds_out) - already-rendered files at the '
+                         f'old size otherwise pass the skip-existing check silently.')
     ap.add_argument('--max-dim', type=int, default=2048,
                     help='hard cap on shipped texture width/height (default 2048; some '
                          'SWG shaders cap at 2048 and larger textures balloon archives)')
@@ -1269,12 +1141,16 @@ def main(argv=None) -> int:
                     help='skip sources larger than this on their longest side (default '
                          '512). High-res sources gain little from AI upscaling but '
                          'dominate render time and archive size; they ship as originals.')
+    ap.add_argument('--batch', type=int, default=None,
+                    help='upscale phase batch size, in "files at 256x256" terms - e.g. '
+                         '--batch 512 is the same as --batch-pixel-budget '
+                         f'{256*256*512:,}. Simpler alternative to --batch-pixel-budget; '
+                         'takes precedence if both are given. Raise/lower to fit your VRAM.')
     ap.add_argument('--batch-pixel-budget', type=int, default=DEFAULT_BATCH_PIXEL_BUDGET,
                     help='upscale phase: max width*height*count per ComfyUI batch '
                          f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 512 files at 256x256, '
-                         'fewer for larger textures) - raise/lower to fit your VRAM. Applies '
-                         'to both the organic and hardsurface ComfyUI groups; arch never '
-                         'batches through ComfyUI at all, so this has no effect on it.')
+                         'fewer for larger textures). See --batch for a simpler way to set '
+                         'this.')
     ap.add_argument('--timeout', type=float, default=900.0,
                     help='per-batch prompt timeout in seconds (default 900 = 15min; '
                          'batches now carry many files per prompt, not one, so this needs '
@@ -1282,6 +1158,9 @@ def main(argv=None) -> int:
     ap.add_argument('--overwrite', action='store_true')
     ap.add_argument('phase', choices=['extract', 'decode', 'upscale', 'encode', 'repack', 'all'])
     args = ap.parse_args(argv)
+
+    if args.batch is not None:
+        args.batch_pixel_budget = args.batch * 256 * 256
 
     src = Path(args.tre).resolve()
     if not src.exists():
@@ -1293,10 +1172,7 @@ def main(argv=None) -> int:
         args.out_tre = str((src.parent if src.is_file() else src) / f'{stem}_hd.tre')
 
     cfg = load_config(Path(args.config))
-    if args.organic_model:
-        cfg['organic_model'] = args.organic_model
-    if args.hardsurface_model:
-        cfg['hardsurface_model'] = args.hardsurface_model
+    cfg['model'] = resolve_model(args, cfg)
     fns = {
         'extract': phase_extract,
         'decode':  phase_decode,
