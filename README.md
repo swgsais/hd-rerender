@@ -50,15 +50,16 @@ one shipped scale (`--ship-scale`). `repack` also drops any strays left in
 `dds_out` by runs that predate the routing, so re-running `repack` alone
 repairs an old staging dir in place.
 
-**Quality tiers:** `--quality {low,med,high}` (default `med`) selects the
-ComfyUI model, via `QUALITY_MODELS` in `hd_rerender.py`. All three tiers
-currently point at the same model (SPAN) — direct testing found it faster
-than the alternatives tried, with no vegetation-hallucination issue observed
-on architecture either, so there's no validated reason yet to run a
-different model for any tier. See **Changing what --quality does** below
-for exactly how to point a tier at a different model once one is validated
-for that purpose. `--model NAME` overrides `--quality` entirely for one-off
-experiments.
+**Quality tiers:** `--quality {low,med,high,custom}` (default `med`) selects
+the ComfyUI model. `low`/`med`/`high` all currently point at the same model
+(SPAN) via `QUALITY_MODELS` in `hd_rerender.py` — direct testing found it
+faster than the alternatives tried, with no vegetation-hallucination issue
+observed on architecture either, so there's no validated reason yet to run
+a different model for any tier. `custom` instead reads its model from the
+config file's `custom_model` key, for picking your own model without
+editing code. See **Changing what --quality does** below for exactly how
+to point a tier at a different model (and how `--quality custom` works).
+`--model NAME` overrides `--quality` entirely for one-off experiments.
 
 ## One-time setup
 
@@ -144,10 +145,11 @@ python hd_rerender.py --tre $src repack    # ~1 min,  <stem>_hd.tre next to the 
 --workers N          decode/encode parallelism (default 4). upscale uses N as
                      parallel-submit count; ComfyUI queues internally so 2-4
                      keeps the GPU saturated.
---quality {low,med,high}
-                     which ComfyUI model to use (default med) — see Quality
-                     tiers above. All three currently resolve to the same
-                     model.
+--quality {low,med,high,custom}
+                     which ComfyUI model to use (default med). low/med/high
+                     all currently resolve to the same model — see Quality
+                     tiers above. custom reads the model from config's
+                     custom_model key instead — see --quality custom below.
 --model NAME         override --quality entirely with a specific .pth for
                      this run
 --ship-scale N       shipped size = source dims x this (default 4 = ship the
@@ -173,7 +175,9 @@ python hd_rerender.py --tre $src repack    # ~1 min,  <stem>_hd.tre next to the 
 ## Changing what --quality does
 
 `QUALITY_MODELS` in `hd_rerender.py` (near the top, alongside
-`EXCLUDED_CATEGORIES`) is the only thing `--quality` reads:
+`EXCLUDED_CATEGORIES`) is what `--quality low`/`med`/`high` read (there's
+also a fourth tier, `--quality custom`, that reads from config instead of
+this file — see below, no code edit needed for that one):
 
 ```python
 SPAN     = '4x-PBRify_UpscalerSPANV4.pth'
@@ -217,6 +221,37 @@ it overrides `--quality`'s model choice entirely for that single run, e.g.:
 ```powershell
 python hd_rerender.py --tre $src --model 4x-PBRify_UpscalerDAT2_V1.pth upscale
 ```
+
+### --quality custom: your own model, without editing code
+
+If you'd rather settle on your own preferred model once and just reuse it,
+without touching `hd_rerender.py` and without retyping a filename on every
+`--model` invocation, set `custom_model` in `hd_rerender.config.json`:
+
+```jsonc
+{
+  "comfy_root": "C:/ComfyUI_windows_portable/ComfyUI",
+  "comfy_api": "http://127.0.0.1:8188",
+  "custom_model": "4x-UltraSharp.pth"
+}
+```
+
+then pass `--quality custom` on any run:
+
+```powershell
+python hd_rerender.py --tre $src --quality custom upscale
+```
+
+`custom_model` is deliberately a *different* key from `model`/
+`upscale_model` (mentioned in the config setup step above) — those two
+override **every** `--quality` tier unconditionally, so setting one means
+`low`/`med`/`high` silently stop meaning what they say. `custom_model` only
+ever takes effect when you explicitly pass `--quality custom`, so `low`/
+`med`/`high` keep behaving normally the rest of the time even if you have a
+`custom_model` sitting in config for occasional use. Passing `--quality
+custom` with no `custom_model` set in config fails fast with a clear error
+telling you what to add, rather than silently falling back to something
+else.
 
 ## Upgrading a staging dir from an older revision
 

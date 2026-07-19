@@ -122,6 +122,16 @@ QUALITY_MODELS = {
     'high': SPAN,
 }
 DEFAULT_QUALITY = 'med'
+
+# A fourth, non-code tier: --quality custom reads its model from the config
+# file's custom_model key instead of QUALITY_MODELS, so a user can settle on
+# their own preferred model once (in config) and just type --quality custom
+# from then on, without editing this file or retyping a filename every run.
+# Distinct from the config's model/upscale_model keys (see resolve_model) -
+# those override EVERY tier unconditionally; custom_model only takes effect
+# when --quality custom is explicitly chosen, so low/med/high keep meaning
+# what they say even if a user has a custom_model set for occasional use.
+CUSTOM_QUALITY = 'custom'
 DEFAULT_SHIP_SCALE = 4   # "medium" ships at the model's full native render, no downscale
 
 
@@ -219,7 +229,9 @@ def load_config(path: Path) -> dict:
 
 
 def resolve_model(args, cfg: dict) -> str:
-    """--model (CLI) > config's model/upscale_model > --quality tier default.
+    """--model (CLI) > config's model/upscale_model (override every tier
+    unconditionally) > --quality tier lookup (QUALITY_MODELS, or the
+    config's custom_model if --quality custom was explicitly chosen).
     upscale_model is a legacy config key from before quality tiers existed;
     still honored so an old config keeps working unchanged."""
     if args.model:
@@ -228,6 +240,13 @@ def resolve_model(args, cfg: dict) -> str:
         return cfg['model']
     if cfg.get('upscale_model'):
         return cfg['upscale_model']
+    if args.quality == CUSTOM_QUALITY:
+        if not cfg.get('custom_model'):
+            raise SystemExit(
+                f"--quality custom requires 'custom_model' set in {args.config}.\n"
+                'Add e.g. "custom_model": "4x-SomeModel.pth" to that file.'
+            )
+        return cfg['custom_model']
     return QUALITY_MODELS[args.quality]
 
 
@@ -1119,11 +1138,13 @@ def main(argv=None) -> int:
     ap.add_argument('--out-tre', default=None,
                     help='output archive path (default: <tre stem>_hd.tre next to the source)')
     ap.add_argument('--workers', type=int, default=4)
-    ap.add_argument('--quality', choices=sorted(QUALITY_MODELS), default=DEFAULT_QUALITY,
+    ap.add_argument('--quality', choices=sorted(list(QUALITY_MODELS) + [CUSTOM_QUALITY]), default=DEFAULT_QUALITY,
                     help=f'which ComfyUI model to use, via QUALITY_MODELS (default '
-                         f'{DEFAULT_QUALITY!r}). All three tiers currently point at the '
-                         f'same model (SPAN) - see QUALITY_MODELS in this file to point a '
-                         f'tier at a different one once validated.')
+                         f'{DEFAULT_QUALITY!r}). All three low/med/high tiers currently '
+                         f'point at the same model (SPAN) - see QUALITY_MODELS in this '
+                         f'file to point one at a different model once validated. '
+                         f'"{CUSTOM_QUALITY}" instead reads the model from the config '
+                         f"file's custom_model key - no code edit needed.")
     ap.add_argument('--model', default=None,
                     help='override --quality entirely with a specific ComfyUI model '
                          'filename, for one-off experiments')

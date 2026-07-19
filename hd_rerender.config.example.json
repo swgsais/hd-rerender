@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to hd_rerender.config.json and edit. comfy_root must be the directory containing main.py and the input/, output/, models/ subfolders. model is the filename of a .pth in models/upscale_models/ - omit it to use --quality's default (SPAN for every tier currently; see QUALITY_MODELS in hd_rerender.py). upscale_model is a legacy alias for model, kept for configs written before quality tiers existed.",
+  "_comment": "Copy to hd_rerender.config.json and edit. comfy_root must be the directory containing main.py and the input/, output/, models/ subfolders. model is the filename of a .pth in models/upscale_models/ - if set, it overrides --quality entirely, for every tier. Omit it to use --quality's default (SPAN for low/med/high currently; see QUALITY_MODELS in hd_rerender.py). upscale_model is a legacy alias for model, kept for configs written before quality tiers existed. custom_model is different: it's only used when --quality custom is passed explicitly, so low/med/high keep their normal meaning even if you have a custom_model set for occasional use.",
   "comfy_root": "C:/ComfyUI_windows_portable/ComfyUI",
   "comfy_api": "http://127.0.0.1:8188"
 }
