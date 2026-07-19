@@ -22,6 +22,7 @@ Writes:
 from __future__ import annotations
 
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -102,6 +103,20 @@ SKY_PREFIXES  = ('sky_', 'cloudtile_', 'env_')
 SKY_CONTAINS  = ('_sky_', '_sky.')
 SKY_NOT       = ('skyskraper', 'skyscraper', 'skyhook')   # buildings, not sky
 
+# Numbered/named channel-data suffixes - narrower than a blanket human-texture
+# exclude (see git history for the hum_ prefix this replaced): _n01/_s01-style
+# suffixes are SWG's convention for indexed customization/channel variants
+# (hum_f_freckles_s01.dds - a face-blemish INDEX map, not real color imagery -
+# is the original green-face/corruption case this exists for), while
+# norm/normal/spec/spc/det/hue are explicit channel-type names. Deliberately
+# does NOT include bare single letters (_a/_b/_d/_e/_g/_h/_m) - those collide
+# with ordinary color-variant diffuse naming (armor_chest_a.dds) and were the
+# actual false-positive risk in the old version of this pattern.
+SPECIAL_SUFFIX_RE = re.compile(
+    r'_(n[0-9]*|s[0-9]*|norm|normal|spec|spc|det|hue)\.dds$',
+    re.IGNORECASE,
+)
+
 
 def is_cube(path: Path) -> bool:
     """Check DDS_CAPS2_CUBEMAP flag in 128-byte header."""
@@ -140,6 +155,9 @@ def categorize_with_reason(name: str, src_path: Path) -> tuple[str, str]:
         return 'special', 'contains:facenormal'
 
     # 3) Special channel data (normal/spec/alpha mask/etc.) - hard skip
+    m = SPECIAL_SUFFIX_RE.search(nl)
+    if m:
+        return 'special', f'suffix_regex:{m.group(0)}'
     for p in SPECIAL_PREFIXES:
         if nl.startswith(p):
             return 'special', f'prefix:{p}'
