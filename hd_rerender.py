@@ -19,16 +19,27 @@ output defaults to <source stem>_hd.tre next to the source.
 `all` runs the lot. Every phase skips files whose output already exists, so
 killing the run mid-way and restarting picks up where it left off.
 
+Every non-excluded texture (see EXCLUDED_CATEGORIES: cube/special/ui/sky
+are never upscaled at all - the engine reads those as structured data, not
+imagery, and upscaled versions corrupt load screens, character face
+tinting, and sky gradients in-game) goes through the same ComfyUI model,
+chosen by --quality (QUALITY_MODELS: low/med/high, default med). --ship-
+scale controls the shipped size relative to the source (default
+DEFAULT_SHIP_SCALE = 4, i.e. ship the model's full native render with no
+downscale).
+
 The DDS format is round-tripped: for every input texture/foo.dds we record
 its width, height, BC format tag, and mipmap-count in manifest.json during
 `decode`, and `encode` uses that tag to pick the right texconv -f flag and
-regenerates a full mipmap chain at the new (4x) dimensions.
+regenerates a full mipmap chain at the new dimensions.
 
 Configuration: edit hd_rerender.config.json next to this script, or pass
 flags. Required keys:
   comfy_root      - absolute path to ComfyUI install
   comfy_api       - base URL of ComfyUI API, default http://127.0.0.1:8188
-  upscale_model   - filename in ComfyUI/models/upscale_models/, e.g. 4x-UltraSharp.pth
+Optional keys:
+  model           - overrides --quality's model choice entirely
+  upscale_model   - legacy alias for model (pre-quality-tier configs)
 """
 from __future__ import annotations
 
@@ -83,6 +94,45 @@ TEXCONV_FORMAT = {
 # per file with little/no internal threading, so those run -singleproc,
 # workers-wide, trading one-file-per-core for one-invocation-uses-all-cores.
 SELF_THREADED_TEXCONV_FORMATS = {'BC7_UNORM'}
+
+# ---------------------------------------------------------------------------
+# Upscale model / quality tiers.
+#
+# Earlier revisions of this file routed arch/organic/hardsurface through
+# different methods and models (arch via plain Lanczos - AI upscalers were
+# thought to hallucinate vegetation onto stone; organic/hardsurface via
+# separate ComfyUI models chosen in an A/B pilot against SWGRestoration's
+# shipped output). Direct testing superseded that: a single model (SPAN)
+# turned out faster than the pilot's picks AND showed no hallucination
+# issue on architecture either, so every category now gets identical
+# treatment - one ComfyUI pass, one model, one shipped scale.
+#
+# --quality selects the model. All three tiers currently point at SPAN -
+# there's no validated reason yet to run a slower model for any tier. Once
+# one is validated for a specific tier, swap the relevant line, e.g.:
+#   'low':  SOME_FASTER_MODEL,
+#   'high': DAT2,   # or DEVIANCE, or a different model entirely
+SPAN     = '4x-PBRify_UpscalerSPANV4.pth'
+DAT2     = '4x-PBRify_UpscalerDAT2_V1.pth'
+DEVIANCE = '4x_BS_DevianceMIP.pth'
+
+QUALITY_MODELS = {
+    'low':  SPAN,
+    'med':  SPAN,
+    'high': SPAN,
+}
+DEFAULT_QUALITY = 'med'
+
+# A fourth, non-code tier: --quality custom reads its model from the config
+# file's custom_model key instead of QUALITY_MODELS, so a user can settle on
+# their own preferred model once (in config) and just type --quality custom
+# from then on, without editing this file or retyping a filename every run.
+# Distinct from the config's model/upscale_model keys (see resolve_model) -
+# those override EVERY tier unconditionally; custom_model only takes effect
+# when --quality custom is explicitly chosen, so low/med/high keep meaning
+# what they say even if a user has a custom_model set for occasional use.
+CUSTOM_QUALITY = 'custom'
+DEFAULT_SHIP_SCALE = 4   # "medium" ships at the model's full native render, no downscale
 
 
 def read_dds_meta(path: Path) -> dict:
@@ -162,16 +212,42 @@ def load_config(path: Path) -> dict:
     if not path.exists():
         raise SystemExit(
             f'config not found: {path}\n'
-            f'create it with: comfy_root, comfy_api, upscale_model\n'
+            f'create it with: comfy_root, comfy_api\n'
             f'see {THIS_DIR / "hd_rerender.config.example.json"}'
         )
-    with path.open('r', encoding='utf-8') as f:
+    # utf-8-sig transparently strips a leading BOM if present and is
+    # otherwise identical to utf-8 - PowerShell's `Out-File -Encoding utf8`
+    # writes a BOM by default (only `utf8NoBOM`, PS7+ only, doesn't), which
+    # plain utf-8 here would reject with a cryptic JSONDecodeError.
+    with path.open('r', encoding='utf-8-sig') as f:
         cfg = json.load(f)
-    for key in ('comfy_root', 'comfy_api', 'upscale_model'):
+    for key in ('comfy_root', 'comfy_api'):
         if key not in cfg:
             raise SystemExit(f'config missing key: {key}')
     cfg['comfy_root'] = str(Path(cfg['comfy_root']).resolve())
     return cfg
+
+
+def resolve_model(args, cfg: dict) -> str:
+    """--model (CLI) > config's model/upscale_model (override every tier
+    unconditionally) > --quality tier lookup (QUALITY_MODELS, or the
+    config's custom_model if --quality custom was explicitly chosen).
+    upscale_model is a legacy config key from before quality tiers existed;
+    still honored so an old config keeps working unchanged."""
+    if args.model:
+        return args.model
+    if cfg.get('model'):
+        return cfg['model']
+    if cfg.get('upscale_model'):
+        return cfg['upscale_model']
+    if args.quality == CUSTOM_QUALITY:
+        if not cfg.get('custom_model'):
+            raise SystemExit(
+                f"--quality custom requires 'custom_model' set in {args.config}.\n"
+                'Add e.g. "custom_model": "4x-SomeModel.pth" to that file.'
+            )
+        return cfg['custom_model']
+    return QUALITY_MODELS[args.quality]
 
 
 def load_manifest(path: Path) -> dict:
@@ -188,20 +264,33 @@ def load_manifest(path: Path) -> dict:
 EXCLUDED_CATEGORIES = ('cube', 'special', 'ui', 'sky')
 
 
-def load_excluded_names(staging: Path) -> set[str]:
-    """DDS basenames the pipeline must not upscale or ship. Reads
-    categories.json written by phase_extract; for older staging dirs that
-    predate it, categorizes on the fly from the manifest."""
+def load_categories(staging: Path) -> dict[str, list[str]]:
+    """{category: [dds basenames]}. Reads categories.json written by
+    phase_extract; for older staging dirs that predate it, categorizes on
+    the fly from the manifest."""
     cat_path = staging / 'categories.json'
     if cat_path.exists():
-        cats = json.loads(cat_path.read_text(encoding='utf-8'))
-    else:
-        from categorize import categorize
-        src_dir = staging / 'dds_in' / 'texture'
-        cats = {}
-        for name in load_manifest(staging / 'manifest.json')['entries']:
-            cats.setdefault(categorize(name, src_dir / name), []).append(name)
+        return json.loads(cat_path.read_text(encoding='utf-8'))
+    from categorize import categorize
+    src_dir = staging / 'dds_in' / 'texture'
+    cats: dict[str, list[str]] = {}
+    for name in load_manifest(staging / 'manifest.json')['entries']:
+        cats.setdefault(categorize(name, src_dir / name), []).append(name)
+    return cats
+
+
+def load_excluded_names(staging: Path) -> set[str]:
+    """DDS basenames the pipeline must not upscale or ship."""
+    cats = load_categories(staging)
     return {n for k in EXCLUDED_CATEGORIES for n in cats.get(k, [])}
+
+
+def target_dims(meta: dict, scale: int, max_dim: int) -> tuple[int, int]:
+    """Shipped size for a source of meta['width']/['height']: scale up,
+    capped at max_dim per side. All categories now use the same scale
+    (--ship-scale, default DEFAULT_SHIP_SCALE), so a single args.ship_scale
+    value feeds this everywhere it's called."""
+    return (min(meta['width'] * scale, max_dim), min(meta['height'] * scale, max_dim))
 
 
 def save_manifest(path: Path, manifest: dict) -> None:
@@ -558,6 +647,7 @@ def phase_upscale(args, cfg: dict) -> int:
     tpl.pop('_comment', None)
 
     api = cfg['comfy_api']
+    model = cfg['model']
     client_id = str(uuid.uuid4())
 
     # /system_stats is a cheap health check that also verifies the API is up.
@@ -593,8 +683,8 @@ def phase_upscale(args, cfg: dict) -> int:
             continue
         todo.append(png)
 
-    print(f'[upscale] {len(todo)} PNG -> HD PNG via ComfyUI ({api}, model={cfg["upscale_model"]}, '
-          f'{skipped_excluded} engine-data files skipped)')
+    print(f'[upscale] {len(todo)} PNG -> HD PNG via ComfyUI ({api}, model={model}, '
+          f'quality={args.quality}, {skipped_excluded} engine-data files skipped)')
     if not todo:
         return 0
 
@@ -655,7 +745,7 @@ def phase_upscale(args, cfg: dict) -> int:
 
         wf = json.loads(json.dumps(tpl))  # deep copy
         wf['1']['inputs']['filenames'] = '\n'.join(f'swg/{n}' for n in names)
-        wf['2']['inputs']['model_name'] = cfg['upscale_model']
+        wf['2']['inputs']['model_name'] = model
         wf['4']['inputs']['filenames'] = '\n'.join(names)
         wf['4']['inputs']['subfolder'] = batch_subfolder
 
@@ -735,14 +825,19 @@ def phase_upscale(args, cfg: dict) -> int:
 
 def prepare_ship_png(png_out: Path, png_in_dir: Path, ship_png: Path,
                      target_wh: tuple[int, int]) -> tuple[str, bool, str | None]:
-    """Turn a raw 4x render into the PNG we actually encode and ship:
+    """Turn a phase_upscale render into the PNG we actually encode and ship:
 
-    - Lanczos-downscale to target_wh (source dims * --ship-scale, capped at
-      --max-dim). Shipping the raw 4x quadrupled archive size for detail the
-      engine never resolves on screen; render-4x-then-ship-2x is the recipe
-      the composite-armor pilot validated against SWGRestoration.
+    - Lanczos-downscale to target_wh (see target_dims() - source dims *
+      --ship-scale, capped at --max-dim, same value for every category).
+      Downscales from the ComfyUI model's native render size (all models
+      here render at their native ~4x, regardless of --quality); render-
+      native-then-ship-smaller is the recipe the composite-armor pilot
+      validated against SWGRestoration. When --ship-scale is left at its
+      default (DEFAULT_SHIP_SCALE = 4, "medium"), target_wh equals the
+      native render size, so this resize is a no-op.
     - Re-attach the source alpha channel (ComfyUI's save path is RGB-only;
-      lost alpha turns alpha-cut foliage/glass/decals into opaque quads).
+      lost alpha turns alpha-cut foliage/glass/decals into opaque quads -
+      the "broken bush" bug).
 
     Runs in a worker process; exceptions are returned, not raised, so one
     corrupt file can't abort the whole encode phase.
@@ -819,8 +914,7 @@ def phase_encode(args, cfg: dict) -> int:
         if target.exists() and not args.overwrite:
             skipped += 1
             continue
-        target_wh = (min(meta['width'] * args.ship_scale, args.max_dim),
-                     min(meta['height'] * args.ship_scale, args.max_dim))
+        target_wh = target_dims(meta, args.ship_scale, args.max_dim)
         pending.append((png, dds_name, tex_fmt, target_wh))
 
     # Ship-prep (downscale to ship size + alpha re-attach) is pure per-file
@@ -1044,14 +1138,23 @@ def main(argv=None) -> int:
     ap.add_argument('--out-tre', default=None,
                     help='output archive path (default: <tre stem>_hd.tre next to the source)')
     ap.add_argument('--workers', type=int, default=4)
-    ap.add_argument('--ship-scale', type=int, default=2,
-                    help='shipped size = source dims x this (default 2). The model still '
-                         'renders at its native 4x; encode Lanczos-downscales to this — '
-                         'the render-4x-ship-2x recipe validated in the composite-armor '
-                         'pilot. Shipping raw 4x quadruples archive size for detail the '
-                         'engine never resolves. Changing this between runs requires '
-                         'encode --overwrite (or deleting dds_out) — already-encoded DDS '
-                         'at the old size otherwise pass the skip-existing check.')
+    ap.add_argument('--quality', choices=sorted(list(QUALITY_MODELS) + [CUSTOM_QUALITY]), default=DEFAULT_QUALITY,
+                    help=f'which ComfyUI model to use, via QUALITY_MODELS (default '
+                         f'{DEFAULT_QUALITY!r}). All three low/med/high tiers currently '
+                         f'point at the same model (SPAN) - see QUALITY_MODELS in this '
+                         f'file to point one at a different model once validated. '
+                         f'"{CUSTOM_QUALITY}" instead reads the model from the config '
+                         f"file's custom_model key - no code edit needed.")
+    ap.add_argument('--model', default=None,
+                    help='override --quality entirely with a specific ComfyUI model '
+                         'filename, for one-off experiments')
+    ap.add_argument('--ship-scale', type=int, default=DEFAULT_SHIP_SCALE,
+                    help=f'shipped size = source dims x this (default {DEFAULT_SHIP_SCALE} '
+                         f'= ship the model\'s full native render, no downscale). Lower to '
+                         f'shrink archive size at the cost of some of the model\'s detail. '
+                         f'Changing this between runs requires upscale/encode --overwrite '
+                         f'(or deleting png_out/dds_out) - already-rendered files at the '
+                         f'old size otherwise pass the skip-existing check silently.')
     ap.add_argument('--max-dim', type=int, default=2048,
                     help='hard cap on shipped texture width/height (default 2048; some '
                          'SWG shaders cap at 2048 and larger textures balloon archives)')
@@ -1059,10 +1162,16 @@ def main(argv=None) -> int:
                     help='skip sources larger than this on their longest side (default '
                          '512). High-res sources gain little from AI upscaling but '
                          'dominate render time and archive size; they ship as originals.')
+    ap.add_argument('--batch', type=int, default=None,
+                    help='upscale phase batch size, in "files at 256x256" terms - e.g. '
+                         '--batch 512 is the same as --batch-pixel-budget '
+                         f'{256*256*512:,}. Simpler alternative to --batch-pixel-budget; '
+                         'takes precedence if both are given. Raise/lower to fit your VRAM.')
     ap.add_argument('--batch-pixel-budget', type=int, default=DEFAULT_BATCH_PIXEL_BUDGET,
                     help='upscale phase: max width*height*count per ComfyUI batch '
-                         f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 128 files at 256x256, '
-                         'scaled down for larger textures) - raise/lower to fit your VRAM')
+                         f'(default {DEFAULT_BATCH_PIXEL_BUDGET:,} = 512 files at 256x256, '
+                         'fewer for larger textures). See --batch for a simpler way to set '
+                         'this.')
     ap.add_argument('--timeout', type=float, default=900.0,
                     help='per-batch prompt timeout in seconds (default 900 = 15min; '
                          'batches now carry many files per prompt, not one, so this needs '
@@ -1070,6 +1179,9 @@ def main(argv=None) -> int:
     ap.add_argument('--overwrite', action='store_true')
     ap.add_argument('phase', choices=['extract', 'decode', 'upscale', 'encode', 'repack', 'all'])
     args = ap.parse_args(argv)
+
+    if args.batch is not None:
+        args.batch_pixel_budget = args.batch * 256 * 256
 
     src = Path(args.tre).resolve()
     if not src.exists():
@@ -1081,6 +1193,7 @@ def main(argv=None) -> int:
         args.out_tre = str((src.parent if src.is_file() else src) / f'{stem}_hd.tre')
 
     cfg = load_config(Path(args.config))
+    cfg['model'] = resolve_model(args, cfg)
     fns = {
         'extract': phase_extract,
         'decode':  phase_decode,

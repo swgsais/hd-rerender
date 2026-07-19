@@ -22,6 +22,7 @@ Writes:
 from __future__ import annotations
 
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -81,8 +82,10 @@ UI_CONTAINS = ('cursor',)
 
 SPECIAL_PREFIXES = (
     'grad_',     # gradient LUT strips (sky color ramps, etc.) - the engine
-                 # samples these as lookup data; upscaling shifts the ramp
+    'cels_',     # samples these as lookup data; upscaling shifts the ramp
     'skybox_',   # skybox faces authored without the cube-map header flag
+    'dirt_',     #
+    'frst_',
 )
 SPECIAL_CONTAINS = (
     '_pattern',  # character face/body customization index patterns - the
@@ -93,6 +96,16 @@ SPECIAL_CONTAINS = (
     '_head',     # system at runtime; resampling shifts the index colors.
                  # Costs a few safe skips (weapon "_head" parts etc.) but
                  # face corruption is far worse than a non-HD vibroblade.
+    '_eye',      # eye customization set (hum_b_eye.dds/_m.dds/eyespec.dds -
+    '_n.',       # missing-eyes corruption case). Catches the whole set
+                 # regardless of suffix convention (the bare _m and the
+                 # underscore-less eyespec companions don't match
+    'rock_',     # SPECIAL_SUFFIX_RE, so this needs to stand on its own).
+    'hum_f_',    # freckles customization set (hum_f_freckles_s01..s05.dds -
+    'hum_m_',    # the original green-face corruption case). Matches every
+    'light_',    # numbered variant via substring, without relying on the
+    'water_',    # number itself meaning anything (see SPECIAL_SUFFIX_RE's
+                 # comment on why numbered suffixes aren't used as a rule).
 )
 
 # Skydome imagery: not palette data, but the arch bucket's Lanczos-only
@@ -101,6 +114,21 @@ SPECIAL_CONTAINS = (
 SKY_PREFIXES  = ('sky_', 'cloudtile_', 'env_')
 SKY_CONTAINS  = ('_sky_', '_sky.')
 SKY_NOT       = ('skyskraper', 'skyscraper', 'skyhook')   # buildings, not sky
+
+# Explicit channel-type name suffixes only - NOT numbered variants (_s01,
+# _n01, etc). Numbered suffixes turned out to be a common plain style/variant
+# naming convention across many ordinary texture types in these TREs (e.g.
+# wall_s01.dds), not a reliable signal of index/channel data on their own -
+# using them here would silently exclude a large number of legitimate
+# textures from upscaling. norm/normal/spec/spc/det/hue name an actual
+# channel type and are far more specific, so they stay. Known customization-
+# overlay families that DO need protection (freckles, eye - both palette/
+# index data, not real color imagery) are matched by name instead, in
+# SPECIAL_CONTAINS below - surgical per-family, not a suffix heuristic.
+SPECIAL_SUFFIX_RE = re.compile(
+    r'_(norm|normal|spec|spc|det|hue)\.dds$',
+    re.IGNORECASE,
+)
 
 
 def is_cube(path: Path) -> bool:
@@ -140,6 +168,9 @@ def categorize_with_reason(name: str, src_path: Path) -> tuple[str, str]:
         return 'special', 'contains:facenormal'
 
     # 3) Special channel data (normal/spec/alpha mask/etc.) - hard skip
+    m = SPECIAL_SUFFIX_RE.search(nl)
+    if m:
+        return 'special', f'suffix_regex:{m.group(0)}'
     for p in SPECIAL_PREFIXES:
         if nl.startswith(p):
             return 'special', f'prefix:{p}'
