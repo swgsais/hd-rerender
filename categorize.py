@@ -86,10 +86,33 @@ SPECIAL_PREFIXES = (
     'skybox_',   # skybox faces authored without the cube-map header flag
     'dirt_',     #
     'frst_',
+    'watr_',
+    'nebula_',
+    'nebula2_',
+    'nebulon',
+    'pirate_asteroid',
+    'neutral',
+    'shuttle_',
+    'slave1_',
+    'spc_',
+    'star_destroyer',
+    'sw_',
+    'spacestation',
+    'sd_',
+    'science_transport',
+    'smuggler_',
+    'planet',
+    'transport_',
+    'tradefed_',
+    'wpm_',
+    'sorosub3000',
+    'space_station',
+    'space_destroyer',
+    'star',
 )
 SPECIAL_CONTAINS = (
     '_pattern',  # character face/body customization index patterns - the
-                 # palette system reads these as indices, not imagery
+    '_spc_',     # palette system reads these as indices, not imagery
     'gradient',  # gradient LUTs (gradient_sky1, sw_gradient_*, ...)
     '_grad.',    # gradient LUTs named as a suffix (glass_grad.dds etc.)
     '_face',     # species face/head diffuse - tinted through the palette
